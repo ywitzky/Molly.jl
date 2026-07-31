@@ -389,6 +389,7 @@ function autotune_force_kernel(buffers, sys::System{D, <:CuArray, T}, pairwise_i
             buffers.interacting_tiles_overflow,
         )
     end
+    println(typeof(buffers.fs_mat_reordered))
 
     return @cuda launch=false maxregs=force_maxregs_override always_inline=true force_kernel!(
         buffers.fs_mat_reordered,
@@ -873,7 +874,7 @@ function Molly.pairwise_forces_loop_gpu!(buffers, sys::System{D, <:CuArray, T}, 
         end
         buffers.step_n_preprocessed = step_n
     end
-    
+
     # Execute Force Kernel over the list of interacting tiles
     auto_kernel = @cuda launch=false always_inline=true force_kernel!(
         buffers.fs_mat_reordered,
@@ -1822,18 +1823,21 @@ function force_kernel!(
 
                 @fastmath force_i_x += ustrip(f[1])
                 if ustrip(f[1]) != zero(T)
-                    CUDA.atomic_add!(pointer(fs_mat, Int64(idx_j) * b - (b - 1)), ustrip(f[1]))
+                    Atomix.@atomic  fs_mat[Int64(idx_j) * b - (b - 1)] += ustrip(f[1])
+                   # CUDA.atomic_add!(pointer(fs_mat, , ustrip(f[1]))
                 end
                 if D >= 2
                     @fastmath force_i_y += ustrip(f[2])
                     if ustrip(f[2]) != zero(T)
-                        CUDA.atomic_add!(pointer(fs_mat, Int64(idx_j) * b - (b - 2)), ustrip(f[2]))
+                        Atomix.@atomic  fs_mat[Int64(idx_j) * b - (b - 2)] += ustrip(f[2])
+                        #CUDA.atomic_add!(pointer(fs_mat, Int64(idx_j) * b - (b - 2)), ustrip(f[2]))
                     end
                 end
                 if D >= 3
                     @fastmath force_i_z += ustrip(f[3])
                     if ustrip(f[3]) != zero(T)
-                        CUDA.atomic_add!(pointer(fs_mat, Int64(idx_j) * b - (b - 3)), ustrip(f[3]))
+                        Atomix.@atomic  fs_mat[Int64(idx_j) * b - (b - 3)] += ustrip(f[3])
+                        #CUDA.atomic_add!(pointer(fs_mat, Int64(idx_j) * b - (b - 3)), ustrip(f[3]))
                     end
                 end
                 
@@ -2037,13 +2041,16 @@ function force_kernel!(
 
     if index_i <= N
         if force_i_x != zero(T)
-            CUDA.atomic_add!(pointer(fs_mat, Int64(index_i) * b - (b - 1)), -force_i_x)
+            Atomix.@atomic fs_mat[ Int64(index_i) * b - (b - 1)] -= force_i_x
+            #CUDA.atomic_add!(pointer(fs_mat, Int64(index_i) * b - (b - 1)), -force_i_x)
         end
         if D >= 2 && force_i_y != zero(T)
-            CUDA.atomic_add!(pointer(fs_mat, Int64(index_i) * b - (b - 2)), -force_i_y)
+            Atomix.@atomic fs_mat[ Int64(index_i) * b - (b - 2)] -= force_i_y
+            #CUDA.atomic_add!(pointer(fs_mat, Int64(index_i) * b - (b - 2)), -force_i_y)
         end
         if D >= 3 && force_i_z != zero(T)
-            CUDA.atomic_add!(pointer(fs_mat, Int64(index_i) * b - (b - 3)), -force_i_z)
+            Atomix.@atomic fs_mat[ Int64(index_i) * b - (b - 3)] -= force_i_z
+            #CUDA.atomic_add!(pointer(fs_mat, Int64(index_i) * b - (b - 3)), -force_i_z)
         end
     end
 
