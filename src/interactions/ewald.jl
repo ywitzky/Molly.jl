@@ -674,62 +674,6 @@ end
     end
 end
 
-function recip_conv_inner!(vir_nou, charge_grid::AbstractArray{Complex{T}, 3}, bsm_x, bsm_y, bsm_z,
-                           recip_box, mesh_dims, energy_units, f_div_eps_r, factor, boxfactor,
-                           kx, ky, kz, ::Val{needs_vir},
-                           ::Val{atomic}) where {T, needs_vir, atomic}
-    if iszero(kx) && iszero(ky) && iszero(kz)
-        return zero(T) * energy_units
-    end
-    nx, ny, nz = mesh_dims
-    maxkx, maxky, maxkz = T(0.5)*(nx+1), T(0.5)*(ny+1), T(0.5)*(nz+1)
-    @inbounds begin
-        mx = (kx < maxkx ? kx : kx - nx)
-        mhx = mx * recip_box[1][1]
-        bx = boxfactor * bsm_x[kx+1]
-        my = (ky < maxky ? ky : ky - ny)
-        mhy = mx * recip_box[2][1] + my * recip_box[2][2]
-        by = bsm_y[ky+1]
-        mz = (kz < maxkz ? kz : kz - nz)
-        mhz = mx * recip_box[3][1] + my * recip_box[3][2] + mz * recip_box[3][3]
-        d1, d2 = reim(charge_grid[kz+1, ky+1, kx+1])
-        m2 = mhx^2 + mhy^2 + mhz^2
-        bz = bsm_z[kz+1]
-        denom = m2 * bx * by * bz
-        c  = exp(-factor * m2)
-        eterm = f_div_eps_r * c / denom
-        eterm_nou = ustrip(energy_units, eterm)
-        charge_grid[kz+1, ky+1, kx+1] = Complex(d1*eterm_nou, d2*eterm_nou)
-        struct2 = d1^2 + d2^2
-
-        if needs_vir
-            # V*P_k = E_k * [I - 2(1 + factor*m2) * (m ⊗ m) / m2], symmetric by construction.
-            Ek = eterm * struct2
-            invm2 = one(T) / m2
-            coeff = 2*one(T) * (one(T) + factor*m2) * invm2
-            gxx = 1 - coeff*mhx*mhx
-            gxy =   - coeff*mhx*mhy
-            gxz =   - coeff*mhx*mhz
-            gyy = 1 - coeff*mhy*mhy
-            gyz =   - coeff*mhy*mhz
-            gzz = 1 - coeff*mhz*mhz
-            G = SMatrix{3, 3, T}(gxx, gxy, gxz,
-                                 gxy, gyy, gyz,
-                                 gxz, gyz, gzz)
-            Ek_nou = ustrip(energy_units, Ek)
-            if atomic
-                for d1 in 1:3
-                    for d2 in 1:3
-                        Atomix.@atomic vir_nou[d1, d2] += Ek_nou * G[d1, d2]
-                    end
-                end
-            else
-                vir_nou .+= Ek_nou .* G
-            end
-        end
-    end
-    return eterm * struct2
-end
 
 function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buffer,
                      bsm_x, bsm_y, bsm_z, recip_box, f_div_eps_r, α, mesh_dims, boundary,
@@ -784,18 +728,16 @@ end
 
 function recip_conv!(vir, buffer_virial, charge_grid::AbstractArray{Complex{T}, 3}, buffer, bsm_x,
                      bsm_y, bsm_z, recip_box, f_div_eps_r, alpha, mesh_dims, boundary, energy_units,
-                     n_threads_val, ::Val{needs_vir}) where {T, needs_vir}
+                     n_threads_val, ::Val{needs_vir}; n_threads_gpu = 16 ) where {T, needs_vir}
     if needs_vir
         buffer_virial .= zero(T)
     end
-    ndrange = Tuple(mesh_dims)
+    ndrange = (mesh_dims[3], mesh_dims[2], mesh_dims[1]) ### change the orientation for coalesced fast access
     factor = T(pi)^2 / alpha^2
     boxfactor = T(pi) * volume(boundary)
     backend = get_backend(charge_grid)
-    n_threads_gpu = 16
     kernel! = recip_conv_kernel!(backend, n_threads_gpu)
-    kernel!(buffer_virial, buffer, charge_grid, bsm_x, bsm_y, bsm_z, recip_box, mesh_dims,
-            energy_units, f_div_eps_r, factor, boxfactor, Val(needs_vir); ndrange=ndrange)
+    kernel!(buffer_virial, buffer, charge_grid, bsm_x, bsm_y, bsm_z, recip_box, mesh_dims,energy_units, f_div_eps_r, factor, boxfactor, Val(needs_vir); ndrange=ndrange)
     if needs_vir
         # The mesh sums both k and -k, so the virial needs the same 1/2 as the energy.
         vir .+= from_device(buffer_virial) .* energy_units / 2
@@ -803,16 +745,73 @@ function recip_conv!(vir, buffer_virial, charge_grid::AbstractArray{Complex{T}, 
     return sum(buffer) * energy_units / 2
 end
 
-@kernel function recip_conv_kernel!(vir, esum_arr, charge_grid, @Const(bsm_x), @Const(bsm_y),
-                                    @Const(bsm_z), recip_box, mesh_dims, energy_units,
-                                    f_div_eps_r, factor, boxfactor,
-                                    ::Val{needs_vir}) where needs_vir
-    kxp1, kyp1, kzp1 = @index(Global, NTuple)
-    if kxp1 <= mesh_dims[1] && kyp1 <= mesh_dims[2] && kzp1 <= mesh_dims[3]
-        esum = recip_conv_inner!(vir, charge_grid, bsm_x, bsm_y, bsm_z, recip_box, mesh_dims,
-                                 energy_units, f_div_eps_r, factor, boxfactor,
-                                 kxp1-1, kyp1-1, kzp1-1, Val(needs_vir), Val(true))
-        esum_arr[kxp1, kyp1, kzp1] = ustrip(energy_units, esum)
+@kernel function recip_conv_kernel!(
+    vir_buffer, esum_arr, charge_grid::AbstractArray{Complex{T}, 3}, 
+    @Const(bsm_x), @Const(bsm_y), @Const(bsm_z), 
+    @Const(recip_box), @Const(mesh_dims),energy_units, f_div_eps_r_nou, factor, boxfactor_nou, 
+    ::Val{needs_vir}
+) where {T,needs_vir}
+    
+    # fasted thread in z direction
+    kzp1, kyp1, kxp1 = @index(Global, NTuple)
+    
+    @inbounds if kxp1 <= mesh_dims[1] && kyp1 <= mesh_dims[2] && kzp1 <= mesh_dims[3]
+        kx, ky, kz = kxp1 - 1, kyp1 - 1, kzp1 - 1
+        
+        if iszero(kx) && iszero(ky) && iszero(kz)
+            esum_arr[kzp1, kyp1, kxp1] = zero(T)# * energy_units
+            if needs_vir
+                @simd for j in 1:9
+                    vir_buffer[j] = zero(T)
+                end
+            end
+        else
+            nx, ny, nz = mesh_dims
+            maxkx, maxky, maxkz = T(0.5)*(nx+1), T(0.5)*(ny+1), T(0.5)*(nz+1)
+            
+            mx = (kx < maxkx ? kx : kx - nx)
+            mhx = mx * recip_box[1][1]
+            bx = boxfactor_nou * bsm_x[kxp1]
+            
+            my = (ky < maxky ? ky : ky - ny)
+            mhy = mx * recip_box[2][1] + my * recip_box[2][2]
+            by = bsm_y[kyp1]
+            
+            mz = (kz < maxkz ? kz : kz - nz)
+            mhz = mx * recip_box[3][1] + my * recip_box[3][2] + mz * recip_box[3][3]
+            
+            d1, d2 = reim(charge_grid[kzp1, kyp1, kxp1])
+            
+            m2 = mhx^2 + mhy^2 + mhz^2
+            bz = bsm_z[kzp1]
+            denom = m2 * bx * by * bz
+            
+            c = exp(-factor * m2)
+            eterm_nou = f_div_eps_r_nou * c / denom
+            eterm_nou = ustrip(energy_units, eterm_nou)
+            
+            charge_grid[kzp1, kyp1, kxp1] = Complex(d1 * eterm_nou, d2 * eterm_nou)
+            
+            struct2 = d1^2 + d2^2
+            Ek_nou = eterm_nou * struct2
+            esum_arr[kzp1, kyp1, kxp1] = Ek_nou
+            
+            if needs_vir
+                invm2 = one(T) / m2
+                coeff = T(2) * (one(T) + factor * m2) * invm2
+                
+                # Buffer-Zugriff ebenfalls coalesced über die Raumachsen geordnet
+                vir_buffer[1, kzp1, kyp1, kxp1] = Ek_nou * (one(T) - coeff * mhx * mhx)
+                vir_buffer[2, kzp1, kyp1, kxp1] = Ek_nou * (-coeff * mhx * mhy)
+                vir_buffer[3, kzp1, kyp1, kxp1] = Ek_nou * (-coeff * mhx * mhz)
+                vir_buffer[4, kzp1, kyp1, kxp1] = Ek_nou * (-coeff * mhx * mhy)
+                vir_buffer[5, kzp1, kyp1, kxp1] = Ek_nou * (one(T) - coeff * mhy * mhy)
+                vir_buffer[6, kzp1, kyp1, kxp1] = Ek_nou * (-coeff * mhy * mhz)
+                vir_buffer[7, kzp1, kyp1, kxp1] = Ek_nou * (-coeff * mhx * mhz)
+                vir_buffer[8, kzp1, kyp1, kxp1] = Ek_nou * (-coeff * mhy * mhz)
+                vir_buffer[9, kzp1, kyp1, kxp1] = Ek_nou * (one(T) - coeff * mhz * mhz)
+            end
+        end
     end
 end
 
