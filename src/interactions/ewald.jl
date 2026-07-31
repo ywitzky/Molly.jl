@@ -282,7 +282,7 @@ is based on the smooth PME algorithm from
 Only compatible with 3D systems.
 Not compatible with infinite boundaries.
 """
-struct PME{T, D, A, I, M, BM, C, CB, RB, VB, P, F, B, SCH} <: AbstractEwald
+struct PME{T, D, A, I, M, BM, C, CB, RB, VB, P,P_SQR, F, B, SCH} <: AbstractEwald
     dist_cutoff::D
     error_tol::T
     order::Int
@@ -291,8 +291,8 @@ struct PME{T, D, A, I, M, BM, C, CB, RB, VB, P, F, B, SCH} <: AbstractEwald
     mesh_dims::SVector{3, Int}
     grid_indices::I
     grid_fractions::M
-    bsplines_θ::M
-    bsplines_dθ::M
+    bsplines_theta::M
+    bsplines_dtheta::M
     bsplines_moduli_x::BM
     bsplines_moduli_y::BM
     bsplines_moduli_z::BM
@@ -301,7 +301,7 @@ struct PME{T, D, A, I, M, BM, C, CB, RB, VB, P, F, B, SCH} <: AbstractEwald
     recip_conv_buffer::RB
     virial_buffer::VB
     pc_sum::P
-    pc_abs2_sum::P
+    pc_abs2_sum::P_SQR
     fft_plan::F
     bfft_plan::B
     scheduler::SCH
@@ -372,8 +372,8 @@ function PME(dist_cutoff, atoms, boundary; error_tol=0.0005, order=5,
     mesh_dims = pme_params.(box_sides(boundary), α, error_tol_T)
     grid_indices = to_device(zeros(Int, 3, n_atoms), AT)
     grid_fractions = to_device(zeros(T, 3, n_atoms), AT)
-    bsplines_θ = to_device(zeros(T, order * n_atoms, 3), AT)
-    bsplines_dθ = zero(bsplines_θ)
+    bsplines_theta = to_device(zeros(T, order * n_atoms, 3), AT)
+    bsplines_dtheta = zero(bsplines_theta)
     # Ordered z/y/x for better memory access
     charge_grid = to_device(zeros(Complex{T}, mesh_dims[3], mesh_dims[2], mesh_dims[1]), AT)
     excluded_pairs = to_device(find_excluded_pairs(eligible, special), AT)
@@ -415,7 +415,7 @@ function PME(dist_cutoff, atoms, boundary; error_tol=0.0005, order=5,
     bsm_z = to_device(bsplines_moduli[3], AT)
 
     return PME(dist_cutoff, error_tol_T, order, T(ϵr), α, mesh_dims, grid_indices, grid_fractions,
-               bsplines_θ, bsplines_dθ, bsm_x, bsm_y, bsm_z, charge_grid, charge_grid_buffer,
+               bsplines_theta, bsplines_dtheta, bsm_x, bsm_y, bsm_z, charge_grid, charge_grid_buffer,
                recip_conv_buffer, virial_buffer, pc_sum, pc_abs2_sum, fft_plan, bfft_plan,
                scheduler, grad_safe)
 end
@@ -435,8 +435,8 @@ function Base.zero(pme::PME)
         pme.mesh_dims,
         zero(pme.grid_indices),
         zero(pme.grid_fractions),
-        zero(pme.bsplines_θ),
-        zero(pme.bsplines_dθ),
+        zero(pme.bsplines_theta),
+        zero(pme.bsplines_dtheta),
         zero(pme.bsplines_moduli_x),
         zero(pme.bsplines_moduli_y),
         zero(pme.bsplines_moduli_z),
@@ -515,72 +515,72 @@ end
     end
 end
 
-function update_bsplines_inner!(bsplines_θ::AbstractArray{T, 2}, bsplines_dθ, grid_fractions,
+function update_bsplines_inner!(bsplines_theta::AbstractArray{T, 2}, bsplines_dtheta, grid_fractions,
                                 order, i) where T
     offset = (i - 1) * order
     @inbounds for j in 1:3
         dr = grid_fractions[j, i]
-        bsplines_θ[offset + order, j] = zero(T)
-        bsplines_θ[offset + 2, j]     = dr
-        bsplines_θ[offset + 1, j]     = 1 - dr
+        bsplines_theta[offset + order, j] = zero(T)
+        bsplines_theta[offset + 2, j]     = dr
+        bsplines_theta[offset + 1, j]     = 1 - dr
         for k in 3:(order-1)
             d = inv(k - one(T))
-            bsplines_θ[offset + k, j] = d * dr * bsplines_θ[offset + k - 1, j]
+            bsplines_theta[offset + k, j] = d * dr * bsplines_theta[offset + k - 1, j]
             for l in 1:(k-2)
-                bsplines_θ[offset + k - l, j] = d * (
-                        (dr + l) * bsplines_θ[offset + k - l - 1, j] +
-                        (k - l - dr) * bsplines_θ[offset + k - l, j]
+                bsplines_theta[offset + k - l, j] = d * (
+                        (dr + l) * bsplines_theta[offset + k - l - 1, j] +
+                        (k - l - dr) * bsplines_theta[offset + k - l, j]
                     )
             end
-            bsplines_θ[offset + 1, j] *= d * (1 - dr)
+            bsplines_theta[offset + 1, j] *= d * (1 - dr)
         end
 
-        bsplines_dθ[offset + 1, j] = -bsplines_θ[offset + 1, j]
+        bsplines_dtheta[offset + 1, j] = -bsplines_theta[offset + 1, j]
         for k in 1:(order-1)
-            bsplines_dθ[offset + k + 1, j] = bsplines_θ[offset + k, j] -
-                                                    bsplines_θ[offset + k + 1, j]
+            bsplines_dtheta[offset + k + 1, j] = bsplines_theta[offset + k, j] -
+                                                    bsplines_theta[offset + k + 1, j]
         end
         d = inv(order - one(T))
-        bsplines_θ[offset + order, j] = d * dr * bsplines_θ[offset + order - 1, j]
+        bsplines_theta[offset + order, j] = d * dr * bsplines_theta[offset + order - 1, j]
         for l in 1:(order-2)
-            bsplines_θ[offset + order - l, j] = d * (
-                    (dr + l) * bsplines_θ[offset + order - l - 1, j] +
-                    (order - l - dr) * bsplines_θ[offset + order - l, j]
+            bsplines_theta[offset + order - l, j] = d * (
+                    (dr + l) * bsplines_theta[offset + order - l - 1, j] +
+                    (order - l - dr) * bsplines_theta[offset + order - l, j]
                 )
         end
-        bsplines_θ[offset + 1, j] *= d * (1 - dr)
+        bsplines_theta[offset + 1, j] *= d * (1 - dr)
     end
-    return bsplines_θ, bsplines_dθ
+    return bsplines_theta, bsplines_dtheta
 end
 
-function update_bsplines!(bsplines_θ::Matrix, bsplines_dθ, grid_fractions, order,
+function update_bsplines!(bsplines_theta::Matrix, bsplines_dtheta, grid_fractions, order,
                           n_threads)
     n_atoms = size(grid_fractions, 2)
     @maybe_threads (n_threads > 1) for chunk_i in 1:n_threads
         for i in chunk_i:n_threads:n_atoms
-            update_bsplines_inner!(bsplines_θ, bsplines_dθ, grid_fractions,
+            update_bsplines_inner!(bsplines_theta, bsplines_dtheta, grid_fractions,
                                    order, i)
         end
     end
-    return bsplines_θ, bsplines_dθ
+    return bsplines_theta, bsplines_dtheta
 end
 
-function update_bsplines!(bsplines_θ, bsplines_dθ, grid_fractions, order,
+function update_bsplines!(bsplines_theta, bsplines_dtheta, grid_fractions, order,
                           n_threads)
     n_atoms = size(grid_fractions, 2)
-    backend = get_backend(bsplines_θ)
+    backend = get_backend(bsplines_theta)
     n_threads_gpu = 128
     kernel! = update_bsplines_kernel!(backend, n_threads_gpu)
-    kernel!(bsplines_θ, bsplines_dθ, grid_fractions, order; ndrange=n_atoms)
-    return bsplines_θ, bsplines_dθ
+    kernel!(bsplines_theta, bsplines_dtheta, grid_fractions, order; ndrange=n_atoms)
+    return bsplines_theta, bsplines_dtheta
 end
 
-@kernel function update_bsplines_kernel!(bsplines_θ, bsplines_dθ, @Const(grid_fractions),
+@kernel function update_bsplines_kernel!(bsplines_theta, bsplines_dtheta, @Const(grid_fractions),
                                          order)
     i = @index(Global, Linear)
     n_atoms = size(grid_fractions, 2)
     if i <= n_atoms
-        update_bsplines_inner!(bsplines_θ, bsplines_dθ, grid_fractions, order, i)
+        update_bsplines_inner!(bsplines_theta, bsplines_dtheta, grid_fractions, order, i)
     end
 end
 
@@ -603,24 +603,24 @@ end
     return charge_grid
 end
 
-@inline function spread_charge_inner!(charge_grid, grid_indices, bsplines_θ,
+@inline function spread_charge_inner!(charge_grid, grid_indices, bsplines_theta,
                               mesh_dims, order, atoms, scheduler, i, ::Val{T},
                               ::Val{atomic}) where {T, atomic}
     q = effective_charge(scheduler, atoms[i], Val(T))
     @inbounds x0index, y0index, z0index = grid_indices[1, i], grid_indices[2, i], grid_indices[3, i]
     @inbounds for ix in 0:(order-1)
         xindex = (x0index + ix) % mesh_dims[1]
-        θx = bsplines_θ[(i-1)*order+ix+1, 1]
+        θx = bsplines_theta[(i-1)*order+ix+1, 1]
         qx = q * θx
         for iy in 0:(order-1)
             yindex = (y0index + iy) % mesh_dims[2]
-            θy = bsplines_θ[(i-1)*order+iy+1, 2]
+            θy = bsplines_theta[(i-1)*order+iy+1, 2]
             qxy = qx * θy
             for iz in 0:(order-1)
                 zindex = (z0index + iz) % mesh_dims[3]
-                θz = bsplines_θ[(i-1)*order+iz+1, 3]
+                θz = bsplines_theta[(i-1)*order+iz+1, 3]
                 cb = qxy * θz
-                add_charge_grid!(charge_grid, zindex + 1, yindex + 1, xindex + 1, cb, Val(atomic))
+                add_charge_grid!(charge_grid, zindex + 1, yindex + 1, xindex + 1, ustrip(cb), Val(atomic))
             end
         end
     end
@@ -628,21 +628,21 @@ end
 end
 
 function spread_charge!(charge_grid::Array{Complex{T}, 3}, buffer, grid_indices,
-                        bsplines_θ, mesh_dims, order, atoms, scheduler, ::Val{1}) where T
+                        bsplines_theta, mesh_dims, order, atoms, scheduler, ::Val{1}) where T
     charge_grid .= zero(Complex{T})
     for i in eachindex(atoms)
-        spread_charge_inner!(charge_grid, grid_indices, bsplines_θ, mesh_dims,
+        spread_charge_inner!(charge_grid, grid_indices, bsplines_theta, mesh_dims,
                              order, atoms, scheduler, i, Val(T), Val(false))
     end
     return charge_grid, buffer
 end
 
-function spread_charge!(charge_grid::Array{Complex{T}, 3}, buffer, grid_indices, bsplines_θ,
+function spread_charge!(charge_grid::Array{Complex{T}, 3}, buffer, grid_indices, bsplines_theta,
                         mesh_dims, order, atoms, scheduler, ::Val{n_threads}) where {T, n_threads}
     Threads.@threads for chunk_i in 1:n_threads
         buffer[chunk_i] .= zero(T)
         for i in chunk_i:n_threads:length(atoms)
-            spread_charge_inner!(buffer[chunk_i], grid_indices, bsplines_θ,
+            spread_charge_inner!(buffer[chunk_i], grid_indices, bsplines_theta,
                                  mesh_dims, order, atoms, scheduler, i, Val(T), Val(false))
         end
     end
@@ -654,28 +654,28 @@ function spread_charge!(charge_grid::Array{Complex{T}, 3}, buffer, grid_indices,
 end
 
 function spread_charge!(charge_grid::AbstractArray{Complex{T}, 3}, buffer, grid_indices,
-                        bsplines_θ, mesh_dims, order, atoms, scheduler, n_threads_val) where T
+                        bsplines_theta, mesh_dims, order, atoms, scheduler, n_threads_val) where T
     backend = get_backend(charge_grid)
     n_threads_gpu = 128
     kernel! = spread_charge_kernel!(backend, n_threads_gpu)
     buffer .= zero(T)
-    kernel!(buffer, grid_indices, bsplines_θ, mesh_dims, order, atoms, scheduler, Val(T);
+    kernel!(buffer, grid_indices, bsplines_theta, mesh_dims, order, atoms, scheduler, Val(T);
             ndrange=length(atoms))
     charge_grid .= Complex.(buffer, zero(T))
     return charge_grid, buffer
 end
 
-@kernel function spread_charge_kernel!(charge_grid_real, @Const(grid_indices), @Const(bsplines_θ),
+@kernel function spread_charge_kernel!(charge_grid_real, @Const(grid_indices), @Const(bsplines_theta),
                                        mesh_dims, order, atoms, scheduler, ::Val{T}) where T
     i = @index(Global, Linear)
     if i <= length(atoms)
-        spread_charge_inner!(charge_grid_real, grid_indices, bsplines_θ, mesh_dims, order, atoms,
+        spread_charge_inner!(charge_grid_real, grid_indices, bsplines_theta, mesh_dims, order, atoms,
                              scheduler, i, Val(T), Val(true))
     end
 end
 
 function recip_conv_inner!(vir_nou, charge_grid::AbstractArray{Complex{T}, 3}, bsm_x, bsm_y, bsm_z,
-                           recip_box, mesh_dims, energy_units, f_div_ϵr, factor, boxfactor,
+                           recip_box, mesh_dims, energy_units, f_div_eps_r, factor, boxfactor,
                            kx, ky, kz, ::Val{needs_vir},
                            ::Val{atomic}) where {T, needs_vir, atomic}
     if iszero(kx) && iszero(ky) && iszero(kz)
@@ -697,7 +697,7 @@ function recip_conv_inner!(vir_nou, charge_grid::AbstractArray{Complex{T}, 3}, b
         bz = bsm_z[kz+1]
         denom = m2 * bx * by * bz
         c  = exp(-factor * m2)
-        eterm = f_div_ϵr * c / denom
+        eterm = f_div_eps_r * c / denom
         eterm_nou = ustrip(energy_units, eterm)
         charge_grid[kz+1, ky+1, kx+1] = Complex(d1*eterm_nou, d2*eterm_nou)
         struct2 = d1^2 + d2^2
@@ -732,7 +732,7 @@ function recip_conv_inner!(vir_nou, charge_grid::AbstractArray{Complex{T}, 3}, b
 end
 
 function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buffer,
-                     bsm_x, bsm_y, bsm_z, recip_box, f_div_ϵr, α, mesh_dims, boundary,
+                     bsm_x, bsm_y, bsm_z, recip_box, f_div_eps_r, α, mesh_dims, boundary,
                      energy_units, ::Val{1}, ::Val{needs_vir}) where {T, needs_vir}
     if needs_vir
         buffer_virial[1] .= zero(T)
@@ -742,7 +742,7 @@ function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buff
     esum = zero(T) * energy_units
     for kx in 0:(mesh_dims[1]-1), ky in 0:(mesh_dims[2]-1), kz in 0:(mesh_dims[3]-1)
         esum_val = recip_conv_inner!(buffer_virial[1], charge_grid, bsm_x, bsm_y, bsm_z, recip_box,
-                            mesh_dims, energy_units, f_div_ϵr, factor, boxfactor, kx, ky, kz,
+                            mesh_dims, energy_units, f_div_eps_r, factor, boxfactor, kx, ky, kz,
                             Val(needs_vir), Val(false))
         esum += esum_val
     end
@@ -754,7 +754,7 @@ function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buff
 end
 
 function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buffer,
-                     bsm_x, bsm_y, bsm_z, recip_box, f_div_ϵr, α, mesh_dims, boundary, energy_units,
+                     bsm_x, bsm_y, bsm_z, recip_box, f_div_eps_r, α, mesh_dims, boundary, energy_units,
                      ::Val{n_threads}, ::Val{needs_vir}) where {T, n_threads, needs_vir}
     factor = T(π)^2 / α^2
     boxfactor = T(π) * volume(boundary)
@@ -766,7 +766,7 @@ function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buff
         for kx in (chunk_i-1):n_threads:(mesh_dims[1]-1)
             for ky in 0:(mesh_dims[2]-1), kz in 0:(mesh_dims[3]-1)
                 esum_val = recip_conv_inner!(buffer_virial[chunk_i], charge_grid, bsm_x, bsm_y,
-                            bsm_z, recip_box, mesh_dims, energy_units, f_div_ϵr, factor, boxfactor,
+                            bsm_z, recip_box, mesh_dims, energy_units, f_div_eps_r, factor, boxfactor,
                             kx, ky, kz, Val(needs_vir), Val(false))
                 buffer[chunk_i] += ustrip(energy_units, esum_val)
             end
@@ -783,19 +783,19 @@ function recip_conv!(vir, buffer_virial, charge_grid::Array{Complex{T}, 3}, buff
 end
 
 function recip_conv!(vir, buffer_virial, charge_grid::AbstractArray{Complex{T}, 3}, buffer, bsm_x,
-                     bsm_y, bsm_z, recip_box, f_div_ϵr, α, mesh_dims, boundary, energy_units,
+                     bsm_y, bsm_z, recip_box, f_div_eps_r, alpha, mesh_dims, boundary, energy_units,
                      n_threads_val, ::Val{needs_vir}) where {T, needs_vir}
     if needs_vir
         buffer_virial .= zero(T)
     end
     ndrange = Tuple(mesh_dims)
-    factor = T(π)^2 / α^2
-    boxfactor = T(π) * volume(boundary)
+    factor = T(pi)^2 / alpha^2
+    boxfactor = T(pi) * volume(boundary)
     backend = get_backend(charge_grid)
     n_threads_gpu = 16
     kernel! = recip_conv_kernel!(backend, n_threads_gpu)
     kernel!(buffer_virial, buffer, charge_grid, bsm_x, bsm_y, bsm_z, recip_box, mesh_dims,
-            energy_units, f_div_ϵr, factor, boxfactor, Val(needs_vir); ndrange=ndrange)
+            energy_units, f_div_eps_r, factor, boxfactor, Val(needs_vir); ndrange=ndrange)
     if needs_vir
         # The mesh sums both k and -k, so the virial needs the same 1/2 as the energy.
         vir .+= from_device(buffer_virial) .* energy_units / 2
@@ -805,19 +805,19 @@ end
 
 @kernel function recip_conv_kernel!(vir, esum_arr, charge_grid, @Const(bsm_x), @Const(bsm_y),
                                     @Const(bsm_z), recip_box, mesh_dims, energy_units,
-                                    f_div_ϵr, factor, boxfactor,
+                                    f_div_eps_r, factor, boxfactor,
                                     ::Val{needs_vir}) where needs_vir
     kxp1, kyp1, kzp1 = @index(Global, NTuple)
     if kxp1 <= mesh_dims[1] && kyp1 <= mesh_dims[2] && kzp1 <= mesh_dims[3]
         esum = recip_conv_inner!(vir, charge_grid, bsm_x, bsm_y, bsm_z, recip_box, mesh_dims,
-                                 energy_units, f_div_ϵr, factor, boxfactor,
+                                 energy_units, f_div_eps_r, factor, boxfactor,
                                  kxp1-1, kyp1-1, kzp1-1, Val(needs_vir), Val(true))
         esum_arr[kxp1, kyp1, kzp1] = ustrip(energy_units, esum)
     end
 end
 
-function interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_θ,
-                            bsplines_dθ, recip_box, mesh_dims, order, energy_units, atoms,
+function interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_theta,
+                            bsplines_dtheta, recip_box, mesh_dims, order, energy_units, atoms,
                             scheduler, ::Val{T}, i) where T
     nx, ny, nz = mesh_dims
     fx, fy, fz = zero(T), zero(T), zero(T)
@@ -826,16 +826,16 @@ function interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_θ,
         x0index, y0index, z0index = grid_indices[1, i], grid_indices[2, i], grid_indices[3, i]
         for ix in 0:(order-1)
             xindex = (x0index + ix) % mesh_dims[1]
-            tx, dtx = bsplines_θ[(i-1)*order+ix+1, 1], bsplines_dθ[(i-1)*order+ix+1, 1]
+            tx, dtx = bsplines_theta[(i-1)*order+ix+1, 1], bsplines_dtheta[(i-1)*order+ix+1, 1]
             for iy in 0:(order-1)
                 yindex = (y0index + iy) % mesh_dims[2]
-                ty, dty = bsplines_θ[(i-1)*order+iy+1, 2], bsplines_dθ[(i-1)*order+iy+1, 2]
+                ty, dty = bsplines_theta[(i-1)*order+iy+1, 2], bsplines_dtheta[(i-1)*order+iy+1, 2]
                 dtx_ty = dtx * ty
                 tx_dty = tx * dty
                 txy = tx * ty
                 for iz in 0:(order-1)
                     zindex = (z0index + iz) % mesh_dims[3]
-                    tz, dtz = bsplines_θ[(i-1)*order+iz+1, 3], bsplines_dθ[(i-1)*order+iz+1, 3]
+                    tz, dtz = bsplines_theta[(i-1)*order+iz+1, 3], bsplines_dtheta[(i-1)*order+iz+1, 3]
                     gridvalue = real(charge_grid[zindex+1, yindex+1, xindex+1])
                     fx += dtx_ty * tz * gridvalue
                     fy += tx_dty * tz * gridvalue
@@ -853,37 +853,37 @@ function interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_θ,
     return Fs
 end
 
-function interpolate_force!(Fs, charge_grid::Array{Complex{T}, 3}, grid_indices, bsplines_θ,
-                            bsplines_dθ, recip_box, mesh_dims, order, energy_units, atoms,
+function interpolate_force!(Fs, charge_grid::Array{Complex{T}, 3}, grid_indices, bsplines_theta,
+                            bsplines_dtheta, recip_box, mesh_dims, order, energy_units, atoms,
                             scheduler, n_threads) where T
     @maybe_threads (n_threads > 1) for chunk_i in 1:n_threads
         for i in chunk_i:n_threads:length(atoms)
-            interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_θ,
-                        bsplines_dθ, recip_box, mesh_dims, order, energy_units, atoms, scheduler,
+            interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_theta,
+                        bsplines_dtheta, recip_box, mesh_dims, order, energy_units, atoms, scheduler,
                         Val(T), i)
         end
     end
     return Fs
 end
 
-function interpolate_force!(Fs, charge_grid::AbstractArray{Complex{T}, 3}, grid_indices, bsplines_θ,
-                            bsplines_dθ, recip_box, mesh_dims, order, energy_units, atoms,
+function interpolate_force!(Fs, charge_grid::AbstractArray{Complex{T}, 3}, grid_indices, bsplines_theta,
+                            bsplines_dtheta, recip_box, mesh_dims, order, energy_units, atoms,
                             scheduler, n_threads) where T
     backend = get_backend(Fs)
     n_threads_gpu = 128
     kernel! = interpolate_force_kernel!(backend, n_threads_gpu)
-    kernel!(Fs, charge_grid, grid_indices, bsplines_θ, bsplines_dθ, recip_box,
+    kernel!(Fs, charge_grid, grid_indices, bsplines_theta, bsplines_dtheta, recip_box,
             mesh_dims, order, energy_units, atoms, scheduler, Val(T); ndrange=length(atoms))
     return Fs
 end
 
 @kernel function interpolate_force_kernel!(Fs, @Const(charge_grid), @Const(grid_indices),
-                        @Const(bsplines_θ), @Const(bsplines_dθ), recip_box, mesh_dims, order,
+                        @Const(bsplines_theta), @Const(bsplines_dtheta), recip_box, mesh_dims, order,
                         energy_units, @Const(atoms), scheduler, ::Val{T}) where T
     i = @index(Global, Linear)
     if i <= length(atoms)
-        interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_θ,
-                    bsplines_dθ, recip_box, mesh_dims, order, energy_units, atoms, scheduler,
+        interpolate_force_inner!(Fs, charge_grid, grid_indices, bsplines_theta,
+                    bsplines_dtheta, recip_box, mesh_dims, order, energy_units, atoms, scheduler,
                     Val(T), i)
     end
 end
@@ -904,24 +904,24 @@ function ewald_pe_forces!(Fs, vir, inter::PME{T}, atoms, coords, boundary, force
     order, ϵr, α, mesh_dims = inter.order, inter.ϵr, inter.α, inter.mesh_dims
     V = volume(boundary)
     f = (energy_units == NoUnits ? ustrip(T(Molly.coulomb_const)) : T(Molly.coulomb_const))
-    f_div_ϵr = f / ϵr
+    f_div_eps_r = f / ϵr
 
     recip_box = invert_box_vectors(boundary)
     grid_placement!(inter.grid_indices, inter.grid_fractions, coords, recip_box, mesh_dims)
-    update_bsplines!(inter.bsplines_θ, inter.bsplines_dθ, inter.grid_fractions, order, n_thr)
+    update_bsplines!(inter.bsplines_theta, inter.bsplines_dtheta, inter.grid_fractions, order, n_thr)
     n_spread_thr = min(n_threads, 4)
     spread_charge!(inter.charge_grid, inter.charge_grid_buffer, inter.grid_indices,
-                   inter.bsplines_θ, mesh_dims, order, atoms, inter.scheduler,
+                   inter.bsplines_theta, mesh_dims, order, atoms, inter.scheduler,
                    Val(n_spread_thr))
     grad_safe_fft!(inter.charge_grid, inter.fft_plan)
     reciprocal_space_E = recip_conv!(vir, inter.virial_buffer, inter.charge_grid,
                     inter.recip_conv_buffer, inter.bsplines_moduli_x, inter.bsplines_moduli_y,
-                    inter.bsplines_moduli_z, recip_box, f_div_ϵr, α, mesh_dims, boundary,
+                    inter.bsplines_moduli_z, recip_box, f_div_eps_r, α, mesh_dims, boundary,
                     energy_units, Val(n_thr), Val(needs_vir))
     grad_safe_bfft!(inter.charge_grid, inter.bfft_plan)
     if calculate_forces
-        interpolate_force!(Fs, inter.charge_grid, inter.grid_indices, inter.bsplines_θ,
-                           inter.bsplines_dθ, recip_box, mesh_dims, order, energy_units, atoms,
+        interpolate_force!(Fs, inter.charge_grid, inter.grid_indices, inter.bsplines_theta,
+                           inter.bsplines_dtheta, recip_box, mesh_dims, order, energy_units, atoms,
                            inter.scheduler, n_thr)
     end
 
@@ -933,8 +933,8 @@ function ewald_pe_forces!(Fs, vir, inter::PME{T}, atoms, coords, boundary, force
     else
         pc_sum, pc_abs2_sum = inter.pc_sum, inter.pc_abs2_sum
     end
-    charge_E = -f_div_ϵr * T(π) * pc_sum^2 / (2 * V * α^2)
-    self_E = f_div_ϵr * -pc_abs2_sum * α / sqrt(T(π)) + charge_E
+    charge_E = -f_div_eps_r * T(π) * pc_sum^2 / (2 * V * α^2)
+    self_E = f_div_eps_r * -pc_abs2_sum * α / sqrt(T(π)) + charge_E
     if needs_vir
         # Since charge_E = -A/V, affine box differentiation gives W = charge_E * I.
         vir .+= charge_E .* I(3)
@@ -986,7 +986,7 @@ struct EwaldExclusionData{T, D, A, F, S}
     error_tol::T
     ϵr::T
     α::A
-    f_div_ϵr::F
+    f_div_eps_r::F
     scheduler::S
 end
 
@@ -997,8 +997,8 @@ function EwaldExclusionData(dist_cutoff; error_tol=0.0005, ϵr=1.0,
     α = inv(dist_cutoff) * sqrt(-log(2 * error_tol_T))
     f = (unit(dist_cutoff) == NoUnits ? ustrip(T(Molly.coulomb_const)) : T(Molly.coulomb_const))
     ϵr_T = T(ϵr)
-    f_div_ϵr = f / ϵr_T
-    return EwaldExclusionData(dist_cutoff, error_tol_T, ϵr_T, α, f_div_ϵr, scheduler)
+    f_div_eps_r = f / ϵr_T
+    return EwaldExclusionData(dist_cutoff, error_tol_T, ϵr_T, α, f_div_eps_r, scheduler)
 end
 
 function Base.zero(inter::EwaldExclusionData{T, D, A, F}) where {T, D, A, F}
@@ -1011,7 +1011,7 @@ function Base.:+(i1::EwaldExclusionData, i2::EwaldExclusionData)
         i1.error_tol + i2.error_tol,
         i1.ϵr + i2.ϵr,
         i1.α + i2.α,
-        i1.f_div_ϵr + i2.f_div_ϵr,
+        i1.f_div_eps_r + i2.f_div_eps_r,
         i1.scheduler,
     )
 end
@@ -1021,14 +1021,14 @@ end
                        data::EwaldExclusionData{T}) where T
     vec_ij = vector(coord_i, coord_j, boundary)
     r = sqrt(sum(abs2, vec_ij))
-    scheduler, α, f_div_ϵr = data.scheduler, data.α, data.f_div_ϵr
+    scheduler, α, f_div_eps_r = data.scheduler, data.α, data.f_div_eps_r
     charge_ij = effective_charge(scheduler, atom_i, Val(T)) *
                 effective_charge(scheduler, atom_j, Val(T))
     αr = α * r
     erf_αr = erf(αr)
     if erf_αr > T(1e-6)
         inv_r = inv(r)
-        dE_dr = f_div_ϵr * charge_ij * inv_r^3 * (erf_αr - 2 * αr * exp(-αr^2) / sqrt(T(π)))
+        dE_dr = f_div_eps_r * charge_ij * inv_r^3 * (erf_αr - 2 * αr * exp(-αr^2) / sqrt(T(π)))
         F = dE_dr * vec_ij
         return SpecificForce2Atoms(F, -F)
     else
@@ -1042,14 +1042,14 @@ end
                                   data::EwaldExclusionData{T}) where T
     vec_ij = vector(coord_i, coord_j, boundary)
     r = sqrt(sum(abs2, vec_ij))
-    scheduler, α, f_div_ϵr = data.scheduler, data.α, data.f_div_ϵr
+    scheduler, α, f_div_eps_r = data.scheduler, data.α, data.f_div_eps_r
     charge_ij = effective_charge(scheduler, atom_i, Val(T)) *
                 effective_charge(scheduler, atom_j, Val(T))
     erf_αr = erf(α * r)
     if erf_αr > T(1e-6)
-        E = -f_div_ϵr * charge_ij * inv(r) * erf_αr
+        E = -f_div_eps_r * charge_ij * inv(r) * erf_αr
     else
-        E = -α * 2 * f_div_ϵr * charge_ij / sqrt(T(π))
+        E = -α * 2 * f_div_eps_r * charge_ij / sqrt(T(π))
     end
     return E
 end
