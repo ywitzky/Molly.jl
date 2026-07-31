@@ -476,9 +476,41 @@ function hash(a::PME, h::UInt)
     return v
 end
 
+"""
+    next_cooley_tukey_size(target::Int; strict_5::Bool=false)
+
+Finds the smallest integer >= `target` that can be factored entirely 
+into small primes (2, 3, 5, 7) required for fast Cooley-Tukey FFT kernels.
+Set `strict_5=true` to limit factors strictly to 2, 3, and 5 for peak performance.
+"""
+function next_cooley_tukey_size(target::Int; strict_5::Bool=false)
+    # Target must be at least 1
+    n = max(6, target)
+    
+    # Allowed factors for cuFFT Cooley-Tukey
+    factors = strict_5 ? (2, 3, 5) : (2, 3, 5, 7)
+    
+    while true
+        temp = n
+        # Divide out all valid factors
+        for p in factors
+            while temp % p == 0
+                temp = div(temp, p)
+            end
+        end
+        
+        # If reduced to 1, all factors were valid
+        if temp == 1
+            return n
+        end
+        
+        n += 1
+    end
+end
+
 function pme_params(side_length, α, error_tol::T) where T
     s = ceil(Int, 2α * side_length / (3 * error_tol^T(0.2)))
-    return max(s, 6)
+    return next_cooley_tukey_size(ceil(Int,s))
 end
 
 function grid_placement_inner!(grid_indices, grid_fractions, coords, recip_box, mesh_dims, i)
