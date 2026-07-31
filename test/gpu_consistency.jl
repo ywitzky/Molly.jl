@@ -257,6 +257,7 @@
                     CUDA.zeros(Int32, tiny_capacity),
                     CUDA.zeros(Int32, tiny_capacity),
                     CUDA.zeros(UInt8, tiny_capacity),
+                    CUDA.zeros(UInt32, tiny_capacity),
                     CUDA.zeros(Int32, 1),
                     CUDA.zeros(Int32, 1),
                     buffers.coords_reordered,
@@ -467,7 +468,6 @@
                 neighbor_finder=GPUNeighborFinder(
                     n_atoms=n_atoms,
                     dist_cutoff=r_cut,
-                    n_steps_reorder=25,
                     device_vector_type=CuArray{Int32, 1},
                 ),
                 force_units=NoUnits,
