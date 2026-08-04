@@ -382,7 +382,7 @@ function PME(dist_cutoff, atoms, boundary; error_tol=0.0005, order=5,
 
     if AT <: AbstractGPUArray
         charge_grid_buffer = to_device(zeros(T, size(charge_grid)), AT)
-        recip_conv_buffer  = to_device(zeros(T, mesh_dims...), AT)
+        recip_conv_buffer  = to_device(zeros(T, reverse(mesh_dims)...), AT)
         virial_buffer      = to_device(zeros(T, 3, 3), AT)
     elseif n_threads > 1
         charge_grid_buffer = [zeros(T, size(charge_grid)) for _ in 1:n_threads]
@@ -510,7 +510,7 @@ end
 
 function pme_params(side_length, α, error_tol::T) where T
     s = ceil(Int, 2α * side_length / (3 * error_tol^T(0.2)))
-    return next_cooley_tukey_size(ceil(Int,s))
+    return max(6,s)#next_cooley_tukey_size(ceil(Int,s))
 end
 
 function grid_placement_inner!(grid_indices, grid_fractions, coords, recip_box, mesh_dims, i)
