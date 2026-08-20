@@ -25,20 +25,19 @@ Molly.bias_gradient(::BiasNaNGradient, cv_sim) = NaN * u"kJ * mol^-1 * nm^-1"
     atom_inds_2 = [4, 5, 6] 
     ArrayTypes = CUDA.functional() ? [Array, CuArray] : [Array]
 
-    for AT in ArrayTypes 
+    for AT in ArrayTypes
         coords_1 = AT(coords[atom_inds_1])
         coords_2 = AT(coords[atom_inds_2])
         atoms_1 = AT(atoms[atom_inds_1])
         atoms_2 = AT(atoms[atom_inds_2])
 
         @test isapprox(
-            Molly.center_of_mass(coords_1,atoms_1),
+            Molly.center_of_mass(coords_1, atoms_1),
             SVector(0.625, 1.0, 1.0)u"nm";
             atol=1e-9u"nm",
         )
-
         @test isapprox(
-            Molly.center_of_mass(coords_2,atoms_2),
+            Molly.center_of_mass(coords_2, atoms_2),
             SVector(1.0333333333333334, 0.9166666666666666, 1.05)u"nm";
             atol=1e-9u"nm",
         )
@@ -108,6 +107,42 @@ Molly.bias_gradient(::BiasNaNGradient, cv_sim) = NaN * u"kJ * mol^-1 * nm^-1"
             Molly.dist_between_groups(calc_dist, coords_1, coords_2, boundary);
             atol=1e-9u"nm",
         )
+
+        # Differently-sized groups: regression test for a transpose bug in
+        # pairwise_distance_matrix's :raw branch that only manifests when the two
+        # groups have different sizes (harmless/undetectable for equal-sized groups)
+        atom_inds_small = [1, 2]
+        coords_small = AT(coords[atom_inds_small])
+
+        calc_dist = CalcMinDist()
+        dist_cv = CalcDist(atom_inds_small, atom_inds_2, calc_dist, :wrap)
+
+        @test isapprox(
+            calculate_cv(dist_cv, coords, atoms, boundary),
+            0.36055512754639896u"nm";
+            atol=1e-9u"nm",
+        )
+        @test isapprox(
+            calculate_cv(dist_cv, coords, atoms, boundary),
+            Molly.dist_between_groups(calc_dist, coords_small, coords_2, boundary);
+            atol=1e-9u"nm",
+        )
+        Molly.cv_gradient(dist_cv, coords, atoms, boundary)
+
+        calc_dist = CalcMaxDist()
+        dist_cv = CalcDist(atom_inds_small, atom_inds_2, calc_dist, :wrap)
+
+        @test isapprox(
+            calculate_cv(dist_cv, coords, atoms, boundary),
+            0.8u"nm";
+            atol=1e-9u"nm",
+        )
+        @test isapprox(
+            calculate_cv(dist_cv, coords, atoms, boundary),
+            Molly.dist_between_groups(calc_dist, coords_small, coords_2, boundary);
+            atol=1e-9u"nm",
+        )
+        Molly.cv_gradient(dist_cv, coords, atoms, boundary)
 
         calc_dist = CalcSingleDist()
         dist_cv = CalcDist([3], [4], calc_dist, :wrap)
@@ -255,6 +290,18 @@ Molly.bias_gradient(::BiasNaNGradient, cv_sim) = NaN * u"kJ * mol^-1 * nm^-1"
         1.5707963267948966; # pi/2 radians
         atol=1e-9
     )
+
+    for AT in ArrayTypes
+        coords_tor_dev = AT(coords_tor)
+        @test isapprox(
+            calculate_cv(tor_cv, coords_tor_dev, atoms, boundary),
+            1.5707963267948966; # pi/2 radians
+            atol=1e-9
+        )
+        grad_dev, phi_dev = Molly.cv_gradient(tor_cv, coords_tor_dev, atoms, boundary)
+        @test isapprox(phi_dev, 1.5707963267948966; atol=1e-9)
+        @test all(v -> all(x -> isfinite(ustrip(x)), v), grad_dev)
+    end
 
     coords_tor_near = SVector{3, Float32}[
         SVector(0.0f0, 0.0f0, 0.0f0),

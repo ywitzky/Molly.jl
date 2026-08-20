@@ -14,28 +14,46 @@ export
 
 # Does not account for periodic boundary conditions, assumes appropriate unwrapping
 function center_of_mass(coords, atoms)
+    com = similar(coords, 1)
+    center_of_mass!(coords, atoms, com)
+    return only(from_device(com))
+end
+
+function center_of_mass!(coords, atoms, com)
     masses = mass.(atoms)
-    com = sum(masses .* coords; dims=1) ./ sum(masses)
-    return only(com)
+    com .= sum(masses .* coords; dims=1) ./ sum(masses)
 end
 
 function calculate_virial(cv, args...; kwargs...) end
 
-function pairwise_distance_matrix(coords_1::AbstractArray{SVector{D, C}},
-                                  coords_2::AbstractArray{SVector{D, C}},
-                                  calc_type,
-                                  boundary) where {D, C}
-    dist_matrix = zeros(C, length(coords_1), length(coords_2))
+function pairwise_displacement_matrix(coords_1::AbstractArray{SVector{D, C}},
+                                      coords_2::AbstractArray{SVector{D, C}},
+                                      calc_type,
+                                      boundary) where {D, C}
+    c1_col = reshape(coords_1, length(coords_1), 1)
+    c2_row = reshape(coords_2, 1, length(coords_2))
     if calc_type == :closest
-        for i in eachindex(coords_1), j in eachindex(coords_2)
-            dist_matrix[i, j] = norm(vector(coords_1[i], coords_2[j], boundary))
-        end
+        return vector.(c1_col, c2_row, (boundary,))
     else
-        for i in eachindex(coords_1), j in eachindex(coords_2)
-            dist_matrix[i, j] = norm(coords_2[i] - coords_1[j])
-        end
+        return c2_row .- c1_col
     end
-    return dist_matrix
+end
+
+function pairwise_distance_matrix(coords_1, coords_2, calc_type, boundary)
+    return norm.(pairwise_displacement_matrix(coords_1, coords_2, calc_type, boundary))
+end
+
+# Finds the pair (i, j) minimizing/maximizing the distance between two groups of atoms,
+# using `extremum_fn = findmin`/`findmax`. Returns the indices, the extremal distance,
+# and the coords_1[i] -> coords_2[j] displacement vector, all without scalar-indexing
+# into `coords_1`/`coords_2` (safe for CuArray input).
+function extremal_pair(coords_1, coords_2, calc_type, extremum_fn, boundary)
+    diffs = pairwise_displacement_matrix(coords_1, coords_2, calc_type, boundary)
+    dist_matrix = norm.(diffs)
+    d, idx = extremum_fn(dist_matrix)
+    i, j = Tuple(idx)
+    r_ij = only(from_device(diffs[i:i, j:j]))
+    return i, j, d, r_ij
 end
 
 function check_calc_type(calc_type)
@@ -124,14 +142,16 @@ end
 
 function dist_between_groups(cd::CalcCMDist, coords_1, coords_2, boundary,
                              atoms_1, atoms_2, args...; kwargs...)
-    com_1 = center_of_mass(coords_1, atoms_1)
-    com_2 = center_of_mass(coords_2, atoms_2)
+    com_1 = similar(coords_1, 1)
+    com_2 = similar(coords_2, 1)
+    center_of_mass!(coords_1, atoms_1, com_1)
+    center_of_mass!(coords_2, atoms_2, com_2)
     if cd.calc_type == :closest
-        com_dist_val = norm(vector(com_1, com_2, boundary))
+        com_dist = norm.(vector.(com_1, com_2, (boundary,)))
     else
-        com_dist_val = norm(com_2 - com_1)
+        com_dist = norm.(com_2 .- com_1)
     end
-    return com_dist_val
+    return only(from_device(com_dist))
 end
 
 """
@@ -157,16 +177,21 @@ struct CalcSingleDist
 end
 
 function dist_between_groups(sd::CalcSingleDist, coords_1, coords_2, boundary, args...; kwargs...)
+    dist_val = similar(coords_1, eltype(eltype(coords_1)), 1)
+    dist_between_groups!(sd, coords_1, coords_2, dist_val, boundary, args...; kwargs...)
+    return only(from_device(dist_val))
+end
+
+function dist_between_groups!(sd::CalcSingleDist, coords_1, coords_2, dist_val, boundary, args...; kwargs...)
     if length(coords_1) > 1 || length(coords_2) > 1
         throw(ArgumentError("CalcSingleDist can only be used with atom groups containing one atom"))
     end
-    c1, c2 = only(coords_1), only(coords_2)
+    c1, c2 = only(from_device(coords_1)), only(from_device(coords_2))
     if sd.calc_type == :closest
-        dist_val = norm(vector(c1, c2, boundary))
+        dist_val .= norm(vector(c1, c2, boundary))
     else
-        dist_val = norm(c2 - c1)
+        dist_val .= norm(c2 - c1)
     end
-    return dist_val
 end
 
 """
@@ -248,7 +273,7 @@ Supported CV Types:
 """
 function cv_gradient(cv::CalcDist{CalcSingleDist}, coords, atoms, boundary, args...; kwargs...)
     i, j = cv.atom_inds_1[1], cv.atom_inds_2[1]
-    c1, c2 = coords[i], coords[j]
+    c1, c2 = only(from_device(coords[i:i])), only(from_device(coords[j:j]))
 
     if cv.dist_type.calc_type == :closest
         r_ij = vector(c1, c2, boundary)
@@ -261,8 +286,8 @@ function cv_gradient(cv::CalcDist{CalcSingleDist}, coords, atoms, boundary, args
 
     if d > zero(d)
         dir = r_ij / d
-        grad[i] = -dir
-        grad[j] = dir
+        grad[i:i] .= (-dir,)
+        grad[j:j] .= (dir,)
     end
 
     return grad, d
@@ -281,39 +306,14 @@ function cv_gradient(cv::CalcDist{CalcMinDist}, coords, atoms, boundary, args...
     c1 = @view coords[cv.atom_inds_1]
     c2 = @view coords[cv.atom_inds_2]
 
-    # Correctly initialize min_d2 by using the numeric typemax of the coordinate's float type
-    T = eltype(eltype(coords))
-    sample_d2 = oneunit(T)^2
-    min_d2 = typemax(typeof(ustrip(sample_d2))) * oneunit(sample_d2)
-    min_idx = (1, 1)
-
-    if cv.dist_type.calc_type == :closest
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, vector(p1, p2, boundary))
-            if d2 < min_d2
-                min_d2 = d2
-                min_idx = (i, j)
-            end
-        end
-        r_ij = vector(c1[min_idx[1]], c2[min_idx[2]], boundary)
-    else
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, p2 - p1)
-            if d2 < min_d2
-                min_d2 = d2
-                min_idx = (i, j)
-            end
-        end
-        r_ij = c2[min_idx[2]] - c1[min_idx[1]]
-    end
-
-    d = sqrt(min_d2)
+    i, j, d, r_ij = extremal_pair(c1, c2, cv.dist_type.calc_type, findmin, boundary)
     grad = ustrip_vec.(zero(coords))
 
     if d > zero(d)
         dir = r_ij / d
-        grad[cv.atom_inds_1[min_idx[1]]] = -dir
-        grad[cv.atom_inds_2[min_idx[2]]] = dir
+        gi, gj = cv.atom_inds_1[i], cv.atom_inds_2[j]
+        grad[gi:gi] .= (-dir,)
+        grad[gj:gj] .= (dir,)
     end
 
     return grad, d
@@ -331,38 +331,14 @@ function cv_gradient(cv::CalcDist{CalcMaxDist}, coords, atoms, boundary, args...
     c1 = @view coords[cv.atom_inds_1]
     c2 = @view coords[cv.atom_inds_2]
 
-    T = eltype(eltype(coords))
-    sample_d2 = oneunit(T)^2
-    max_d2 = typemin(typeof(ustrip(sample_d2))) * oneunit(sample_d2)
-    max_idx = (1, 1)
-
-    if cv.dist_type.calc_type == :closest
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, vector(p1, p2, boundary))
-            if d2 > max_d2
-                max_d2 = d2
-                max_idx = (i, j)
-            end
-        end
-        r_ij = vector(c1[max_idx[1]], c2[max_idx[2]], boundary)
-    else
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, p2 - p1)
-            if d2 > max_d2
-                max_d2 = d2
-                max_idx = (i, j)
-            end
-        end
-        r_ij = c2[max_idx[2]] - c1[max_idx[1]]
-    end
-
-    d = sqrt(max_d2)
+    i, j, d, r_ij = extremal_pair(c1, c2, cv.dist_type.calc_type, findmax, boundary)
     grad = ustrip_vec.(zero(coords))
 
     if d > zero(d)
         dir = r_ij / d
-        grad[cv.atom_inds_1[max_idx[1]]] = -dir
-        grad[cv.atom_inds_2[max_idx[2]]] = dir
+        gi, gj = cv.atom_inds_1[i], cv.atom_inds_2[j]
+        grad[gi:gi] .= (-dir,)
+        grad[gj:gj] .= (dir,)
     end
 
     return grad, d
@@ -383,8 +359,11 @@ function cv_gradient(cv::CalcDist{CalcCMDist}, coords, atoms, boundary, args...;
     a1 = @view atoms[cv.atom_inds_1]
     a2 = @view atoms[cv.atom_inds_2]
 
-    com1 = center_of_mass(c1, a1)
-    com2 = center_of_mass(c2, a2)
+    com1_buf = similar(c1, 1)
+    com2_buf = similar(c2, 1)
+    center_of_mass!(c1, a1, com1_buf)
+    center_of_mass!(c2, a2, com2_buf)
+    com1, com2 = only(from_device(com1_buf)), only(from_device(com2_buf))
 
     if cv.dist_type.calc_type == :closest
         r_12 = vector(com1, com2, boundary)
@@ -397,18 +376,12 @@ function cv_gradient(cv::CalcDist{CalcCMDist}, coords, atoms, boundary, args...;
 
     if d > zero(d)
         dir = r_12 / d
-        
-        m1 = mass.(a1)
-        m2 = mass.(a2)
-        M1 = sum(m1)
-        M2 = sum(m2)
-        
-        for (idx, i) in enumerate(cv.atom_inds_1)
-            grad[i] += -dir * (m1[idx] / M1)
-        end
-        for (idx, j) in enumerate(cv.atom_inds_2)
-            grad[j] += dir * (m2[idx] / M2)
-        end
+
+        m1, m2 = mass.(a1), mass.(a2)
+        M1, M2 = sum(m1), sum(m2)
+
+        grad[cv.atom_inds_1] = (-dir,) .* (m1 ./ M1)
+        grad[cv.atom_inds_2] = (dir,) .* (m2 ./ M2)
     end
 
     return grad, d
@@ -421,12 +394,14 @@ end
 function calculate_virial_dist!(virial_buff, dt::CalcSingleDist, cv, coords, forces, atoms, boundary)
     i = cv.atom_inds_1[1]
     j = cv.atom_inds_2[1]
-    f_i = forces[i]
+    f_i = only(from_device(forces[i:i]))
+    c_i = only(from_device(coords[i:i]))
+    c_j = only(from_device(coords[j:j]))
 
     if dt.calc_type == :closest
-        r_ji = vector(coords[j], coords[i], boundary)
+        r_ji = vector(c_j, c_i, boundary)
     else
-        r_ji = coords[i] - coords[j]
+        r_ji = c_i - c_j
     end
 
     virial_buff .+= r_ji * transpose(f_i)
@@ -435,32 +410,10 @@ end
 function calculate_virial_dist!(virial_buff, dt::CalcMinDist, cv, coords, forces, atoms, boundary)
     c1 = @view coords[cv.atom_inds_1]
     c2 = @view coords[cv.atom_inds_2]
-    
-    T = eltype(eltype(coords))
-    sample_d2 = oneunit(T)^2
-    min_d2 = typemax(typeof(ustrip(sample_d2))) * oneunit(sample_d2)
-    min_idx = (1, 1)
-    
-    if dt.calc_type == :closest
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, vector(p1, p2, boundary))
-            if d2 < min_d2
-                min_d2 = d2
-                min_idx = (i, j)
-            end
-        end
-        r_ji = vector(c2[min_idx[2]], c1[min_idx[1]], boundary)
-    else
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, p2 - p1)
-            if d2 < min_d2
-                min_d2 = d2
-                min_idx = (i, j)
-            end
-        end
-        r_ji = c1[min_idx[1]] - c2[min_idx[2]]
-    end
-    
+
+    _, _, _, r_ij = extremal_pair(c1, c2, dt.calc_type, findmin, boundary)
+    r_ji = -r_ij
+
     f_sum = sum(forces[cv.atom_inds_1])
     virial_buff .+= r_ji * transpose(f_sum)
 end
@@ -468,32 +421,10 @@ end
 function calculate_virial_dist!(virial_buff, dt::CalcMaxDist, cv, coords, forces, atoms, boundary)
     c1 = @view coords[cv.atom_inds_1]
     c2 = @view coords[cv.atom_inds_2]
-    
-    T = eltype(eltype(coords))
-    sample_d2 = oneunit(T)^2
-    max_d2 = typemin(typeof(ustrip(sample_d2))) * oneunit(sample_d2)
-    max_idx = (1, 1)
-    
-    if dt.calc_type == :closest
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, vector(p1, p2, boundary))
-            if d2 > max_d2
-                max_d2 = d2
-                max_idx = (i, j)
-            end
-        end
-        r_ji = vector(c2[max_idx[2]], c1[max_idx[1]], boundary)
-    else
-        for (i, p1) in enumerate(c1), (j, p2) in enumerate(c2)
-            d2 = sum(abs2, p2 - p1)
-            if d2 > max_d2
-                max_d2 = d2
-                max_idx = (i, j)
-            end
-        end
-        r_ji = c1[max_idx[1]] - c2[max_idx[2]]
-    end
-    
+
+    _, _, _, r_ij = extremal_pair(c1, c2, dt.calc_type, findmax, boundary)
+    r_ji = -r_ij
+
     f_sum = sum(forces[cv.atom_inds_1])
     virial_buff .+= r_ji * transpose(f_sum)
 end
@@ -504,8 +435,11 @@ function calculate_virial_dist!(virial_buff, dt::CalcCMDist, cv, coords, forces,
     a1 = @view atoms[cv.atom_inds_1]
     a2 = @view atoms[cv.atom_inds_2]
 
-    com1 = center_of_mass(c1, a1)
-    com2 = center_of_mass(c2, a2)
+    com1_buf = similar(c1, 1)
+    com2_buf = similar(c2, 1)
+    center_of_mass!(c1, a1, com1_buf)
+    center_of_mass!(c2, a2, com2_buf)
+    com1, com2 = only(from_device(com1_buf)), only(from_device(com2_buf))
 
     if dt.calc_type == :closest
         r_12 = vector(com2, com1, boundary)
@@ -565,29 +499,20 @@ function cv_gradient(cv::CalcRg, coords, atoms, boundary, args...; kwargs...)
     c_used = @view coords[atom_inds_used]
     a_used = @view atoms[atom_inds_used]
 
-    com = center_of_mass(c_used, a_used)
+    com_buf = similar(c_used, 1)
+    center_of_mass!(c_used, a_used, com_buf)
     m_used = mass.(a_used)
     M_total = sum(m_used)
 
-    sample_r2 = sum(abs2, vector(com, c_used[1], boundary))
-    rg_sq = zero(eltype(m_used)) * sample_r2
-
-    for (idx, c) in enumerate(c_used)
-        r_ic = vector(com, c, boundary)
-        rg_sq += m_used[idx] * sum(abs2, r_ic)
-    end
-    
-    rg_sq /= M_total
+    r_ic_all = vector.(com_buf, c_used, (boundary,))
+    rg_sq = sum(sum_abs2.(r_ic_all) .* m_used) / M_total
     rg = sqrt(rg_sq)
 
     grad = ustrip_vec.(zero(coords))
 
     if rg > zero(rg)
         factor = 1 / (M_total * rg)
-        for (idx, i) in enumerate(atom_inds_used)
-            r_ic = vector(com, c_used[idx], boundary)
-            grad[i] += factor * m_used[idx] * r_ic
-        end
+        grad[atom_inds_used] = (factor,) .* m_used .* r_ic_all
     end
 
     return grad, rg
@@ -617,16 +542,14 @@ function calculate_virial!(virial_buff, cv::CalcRg, coords, forces, atoms, bound
     c_used = @view coords[ids]
     f_used = @view forces[ids]
     a_used = @view atoms[ids]
-    
+
     # Calculate Center of Mass of the group to define relative coordinates
-    com = center_of_mass(c_used, a_used)
+    com_buf = similar(c_used, 1)
+    center_of_mass!(c_used, a_used, com_buf)
 
     # Accumulate sum( (r_i - r_com) * F_i^T )
-    for (c, f) in zip(c_used, f_used)
-        # Vector from COM to atom i (r_i - r_com), handling PBC
-        r_ic = vector(com, c, boundary) 
-        virial_buff .+= r_ic * transpose(f)
-    end
+    r_ic_all = vector.(com_buf, c_used, (boundary,))
+    virial_buff .+= sum(r_ic_all .* transpose.(f_used))
 end
 
 """
@@ -708,9 +631,7 @@ function cv_gradient(cv::CalcRMSD, coords, args...; kwargs...)
 
     if rmsd_val > zero(rmsd_val)
         factor = 1 / (N * rmsd_val)
-        for (idx, i) in enumerate(atom_inds_used)
-            grad[i] += factor * -diffs[idx]
-        end
+        grad[atom_inds_used] = (-factor,) .* diffs
     end
 
     return grad, rmsd_val
@@ -727,11 +648,8 @@ function calculate_virial!(virial_buff, cv::CalcRMSD, coords, forces, atoms, bou
     com = mean(c_used)
 
     # Accumulate sum( (r_i - r_centroid) * F_i^T )
-    for (c, f) in zip(c_used, f_used)
-        # Vector from centroid to atom i
-        r_ic = vector(com, c, boundary)
-        virial_buff .+= r_ic * transpose(f)
-    end
+    r_ic_all = vector.((com,), c_used, (boundary,))
+    virial_buff .+= sum(r_ic_all .* transpose.(f_used))
 end
 
 """
@@ -769,8 +687,8 @@ struct CalcTorsion
 end
 
 function calculate_cv(cv::CalcTorsion, coords, atoms, boundary, args...; kwargs...)
-    c = @view coords[collect(cv.atom_inds)]
-    return  torsion_angle(c[1], c[2], c[3], c[4], boundary)
+    pts = from_device(coords[cv.atom_inds])
+    return torsion_angle(pts[1], pts[2], pts[3], pts[4], boundary)
 end
 
 # Computes the analytical gradient of the torsion (dihedral) angle defined by four atoms.
@@ -799,8 +717,9 @@ end
 
 function cv_gradient(cv::CalcTorsion, coords, atoms, boundary, args...; kwargs...)
     i, j, k, l = cv.atom_inds
-    ri, rj, rk, rl = coords[i], coords[j], coords[k], coords[l]
-    
+    pts = from_device(coords[[i, j, k, l]])
+    ri, rj, rk, rl = pts[1], pts[2], pts[3], pts[4]
+
     b1 = vector(ri, rj, boundary)
     b2 = vector(rj, rk, boundary)
     b3 = vector(rk, rl, boundary)
@@ -838,23 +757,22 @@ function cv_gradient(cv::CalcTorsion, coords, atoms, boundary, args...; kwargs..
     grad_j = -(1 + b1_dot_b2 / b2_sq_eff) * grad_i + (b3_dot_b2 / b2_sq_eff) * grad_l
     grad_k = (b1_dot_b2 / b2_sq_eff) * grad_i - (1 + b3_dot_b2 / b2_sq_eff) * grad_l
 
-    grad[i] = grad_i
-    grad[j] = grad_j
-    grad[k] = grad_k
-    grad[l] = grad_l
- 
+    grad[[i, j, k, l]] = [grad_i, grad_j, grad_k, grad_l]
+
     return -grad, phi
 end
 
 function calculate_virial!(virial_buff, cv::CalcTorsion, coords, forces, atoms, boundary)
-    ids = collect(cv.atom_inds)
-    c = @view coords[ids]
-    f = @view forces[ids]
-    r_ji = vector(c[2], c[1], boundary) # r_i - r_j
-    r_jk = vector(c[2], c[3], boundary) # r_k - r_j
-    r_jl = vector(c[2], c[4], boundary) # r_l - r_j
+    ids = cv.atom_inds
+    pts = from_device(coords[ids])
+    fs = from_device(forces[ids])
+    c1, c2, c3, c4 = pts[1], pts[2], pts[3], pts[4]
+    f1, f3, f4 = fs[1], fs[3], fs[4]
+    r_ji = vector(c2, c1, boundary) # r_i - r_j
+    r_jk = vector(c2, c3, boundary) # r_k - r_j
+    r_jl = vector(c2, c4, boundary) # r_l - r_j
 
-    virial_buff .+= r_ji * transpose(f[1]) +
-                    r_jk * transpose(f[3]) +
-                    r_jl * transpose(f[4])
+    virial_buff .+= r_ji * transpose(f1) +
+                    r_jk * transpose(f3) +
+                    r_jl * transpose(f4)
 end
