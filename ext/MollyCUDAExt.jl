@@ -886,6 +886,24 @@ end
     return needs_morton_refresh, needs_reorder, needs_sparse_refresh, needs_tile_refresh
 end
 
+function Molly.is_tile_refresh_step(sys::System{D, <:CuArray, T}, buffers, step_n::Integer) where {D, T}
+    nf = sys.neighbor_finder
+    nf isa GPUNeighborFinder || return false
+    _, _, _, needs_tile_refresh = gpu_neighbor_refresh_flags(buffers, nf, step_n)
+    return needs_tile_refresh
+end
+
+# CUDA graph capture: records the kernel-launch sequence of one steady-state forces! call once,
+# then replays it (CUDA.@captured) instead of re-dispatching every kernel from the host each step.
+# Only reached when simulate!'s use_cuda_graph=true and check_cuda_graph_legality
+# (src/simulators.jl) has already verified every precondition holds (GPU-resident System, no
+# CalcRMSD/custom-CV/:pbc-correction BiasPotential, no virtual sites/constraints), and the caller
+# has already excluded virial/tile-refresh steps (is_tile_refresh_step above).
+function Molly.captured_forces!(sys::System{D, <:CuArray, T}, args...; kwargs...) where {D, T}
+    @captured Molly.forces!(args...; kwargs...)
+    return nothing
+end
+
 function refresh_interacting_tiles!(buffers, sys::System{D, <:CuArray, T}, N::Int) where {D, T}
     n_blocks = cld(N, WARPSIZE)
     if sys.boundary isa TriclinicBoundary

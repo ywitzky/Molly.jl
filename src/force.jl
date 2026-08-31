@@ -198,9 +198,11 @@ mutable struct BufferValidity
     pressure_step::Int
     pre_coupling_virial_step::Int
     pre_coupling_pressure_step::Int
+    unwrap_step::Int
 end
 
 BufferValidity() = BufferValidity(
+    INVALID_BUFFER_STEP,
     INVALID_BUFFER_STEP,
     INVALID_BUFFER_STEP,
     INVALID_BUFFER_STEP,
@@ -296,6 +298,37 @@ end
 
 function has_interaction_virial(buffers, step_n::Integer)
     return has_interaction_virial(buffers.validity, step_n)
+end
+
+# Whether a general_inters entry needs `sys`'s bonded-molecule-unwrapped coordinates for this
+# step (only true for a BiasPotential whose CV has correction==:pbc, src/bias/bias.jl) -- the
+# generic fallback covers every other interaction type, which never needs this.
+bias_needs_unwrap(inter) = false
+
+# Computes unwrap_molecules(sys) at most once per step_n and caches it on `buffers`, so every
+# attached BiasPotential needing correction==:pbc shares one computation instead of each
+# independently recomputing it (a real, previously-happening N-fold redundancy for N
+# simultaneously-attached :pbc-correction CVs).
+function ensure_unwrapped_coords!(buffers, sys, step_n::Integer)
+    if !has_unwrap(buffers.validity, step_n)
+        buffers.unwrapped_coords[] = unwrap_molecules(sys)
+        mark_unwrap!(buffers.validity, step_n)
+    end
+    return buffers.unwrapped_coords[]
+end
+
+function mark_unwrap!(v::BufferValidity, step_n::Integer)
+    v.unwrap_step = Int(step_n)
+    return v
+end
+
+function invalidate_unwrap!(v::BufferValidity)
+    v.unwrap_step = INVALID_BUFFER_STEP
+    return v
+end
+
+function has_unwrap(v::BufferValidity, step_n::Integer)
+    return v.unwrap_step == step_n
 end
 
 function has_constraint_virial(buffers, step_n::Integer)
@@ -506,6 +539,7 @@ mutable struct BuffersGPU{F, P, V, VN, KT, PT, C, M, R, IT, ITT, ITD, NIT, OIT, 
     constraint_velocities_buffer::Base.RefValue{Any}
     constraint_preview_coords_buffer::Base.RefValue{Any}
     constraint_preview_velocities_buffer::Base.RefValue{Any}
+    unwrapped_coords::Base.RefValue{Any}   # shared, once-per-step cache: see ensure_unwrapped_coords!
     validity::BufferValidity
     box_mins::C
     box_maxs::C
@@ -548,6 +582,7 @@ function BuffersGPU(fs_mat, pe_vec_nounits, virial, virial_nounits, kin_tensor, 
                       pre_coupling_ref(), pre_coupling_ref(), pre_coupling_ref(),
                       constraint_scratch_ref(), constraint_scratch_ref(),
                       constraint_scratch_ref(), constraint_scratch_ref(),
+                      pre_coupling_ref(),
                       BufferValidity(), box_mins, box_maxs, morton_seq,
                       morton_seq_buffer_1, morton_seq_buffer_2, morton_seq_inv,
                       compressed_masks, tile_is_clean, interacting_tiles_i,
@@ -670,6 +705,7 @@ function init_buffers!(sys::System{D, <:AbstractGPUArray, T, TH}, n_threads,
                       kin, pres, pre_coupling_ref(), pre_coupling_ref(),
                       pre_coupling_ref(), constraint_scratch_ref(), constraint_scratch_ref(),
                       constraint_scratch_ref(), constraint_scratch_ref(),
+                      pre_coupling_ref(),
                       BufferValidity(), box_mins, box_maxs, morton_seq,
                       morton_seq_buffer_1, morton_seq_buffer_2, morton_seq_inv,
                       compressed_masks, tile_is_clean, interacting_tiles_i,
@@ -680,6 +716,18 @@ function init_buffers!(sys::System{D, <:AbstractGPUArray, T, TH}, n_threads,
 end
 
 zero_forces(sys) = ustrip_vec.(zero(sys.coords)) .* sys.force_units
+
+# Generic fallback: no graph capture, just calls forces! directly. Overridden for a CuArray-backed
+# System in ext/MollyCUDAExt.jl with an actual CUDA.@captured-wrapped body. Called from
+# simulate!'s step loop (src/simulators.jl, use_cuda_graph=true, Langevin only for now) instead of
+# calling forces! directly, so the same call site works whether or not graph capture applies.
+captured_forces!(sys, args...; kwargs...) = forces!(args...; kwargs...)
+
+# Whether this step is one where the GPU neighbor/tile list is refreshed -- refresh does a host
+# sync that sizes the next kernel launch's grid (ext/MollyCUDAExt.jl's
+# gpu_neighbor_refresh_flags/refresh_interacting_tiles!), which cannot sit inside a captured CUDA
+# graph. Generic fallback (CPU, or no neighbor finder needing this distinction): always false.
+is_tile_refresh_step(sys, buffers, step_n::Integer) = false
 
 """
     forces(system, neighbors=find_neighbors(system), step_n=0;
@@ -1238,7 +1286,8 @@ function forces!(fs,
                  n_threads::Integer=Threads.nthreads(),
                  pairwise_inters=sys.pairwise_inters,
                  specific_inter_lists=sys.specific_inter_lists,
-                 general_inters=sys.general_inters) where {D, T, TH, needs_vir}
+                 general_inters=sys.general_inters,
+                 cuda_graph_capturing::Bool=false) where {D, T, TH, needs_vir}
     if needs_vir
         fill!(buffers.virial, zero(T) * sys.energy_units)
         fill!(buffers.virial_nounits, zero(TH))
@@ -1275,9 +1324,15 @@ function forces!(fs,
         buffers.virial .+= from_device(buffers.virial_nounits) .* sys.energy_units
     end
 
+    # Compute unwrap_molecules(sys) at most once here, shared by every attached BiasPotential
+    # that needs it (correction==:pbc), instead of each recomputing it independently below.
+    if any(bias_needs_unwrap, values(general_inters))
+        ensure_unwrapped_coords!(buffers, sys, step_n)
+    end
     for inter in values(general_inters)
         AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
-                                 n_threads=n_threads, buffers=buffers, needs_vir=needs_vir)
+                                 n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
+                                 cuda_graph_capturing=cuda_graph_capturing)
     end
     distribute_forces!(fs, sys, buffers)
 

@@ -43,6 +43,53 @@ function check_simulate_inputs(init_step::Integer, run_loggers, strictness)
     check_strictness(strictness)
 end
 
+# use_cuda_graph=true (Langevin's simulate! only, for now) wraps the steady-state (non-virial,
+# non-tile-refresh) forces! call of each step in a CUDA graph (CUDA.@captured), amortising
+# per-kernel host-dispatch overhead across the whole step instead of paying it per launch --
+# valuable when several BiasPotentials are attached (3-10 simultaneous CVs). This requires every
+# kernel launched inside the captured region to have zero host syncs and zero GPU allocation, so
+# it's illegal (and errors loudly here rather than silently falling back) unless ALL of the
+# following hold. See BiasPotential's cuda_graph_capturing branch (src/bias/bias.jl) and
+# ensure_unwrapped_coords! (src/force.jl) for what these translate to internally.
+function check_cuda_graph_legality(sys, use_cuda_graph::Bool)
+    use_cuda_graph || return nothing
+    if !(sys.coords isa AbstractGPUArray)
+        error("use_cuda_graph=true requires a GPU-resident System (sys.coords isa AbstractGPUArray).")
+    end
+    for inter in values(sys.general_inters)
+        inter isa BiasPotential || continue
+        if !inter.uses_persistent_buffers
+            error("use_cuda_graph=true is not supported: a BiasPotential with CV type " *
+                  "$(typeof(inter.cv_type)) does not use the built-in persistent-buffer " *
+                  "cv_gradient! path (custom/AD-only CV types allocate every call).")
+        end
+        if inter.cv_type isa CalcRMSD
+            error("use_cuda_graph=true is not supported for CalcRMSD: its Kabsch alignment " *
+                  "requires a host SVD every call, which cannot be captured.")
+        end
+        if inter.cv_type isa CalcDist{<:Union{CalcMinDist, CalcMaxDist}}
+            error("use_cuda_graph=true is not supported for CalcMinDist/CalcMaxDist: their " *
+                  "extremal-pair search returns a host index via findmin/findmax every call " *
+                  "(confirmed directly: this raises a device-side exception when it runs " *
+                  "inside a captured region), which cannot be captured.")
+        end
+        if inter.cv_type.correction == :pbc
+            error("use_cuda_graph=true is not supported for a BiasPotential with " *
+                  "correction=:pbc: unwrap_molecules allocates GPU memory every call, which " *
+                  "cannot be captured. Use correction=:wrap instead.")
+        end
+    end
+    if length(sys.virtual_sites) > 0
+        error("use_cuda_graph=true is not supported for a System with virtual sites " *
+              "(not audited for graph-capture safety).")
+    end
+    if length(sys.constraints) > 0
+        error("use_cuda_graph=true is not supported for a System with constraints " *
+              "(not audited for graph-capture safety).")
+    end
+    return nothing
+end
+
 function default_show_progress()
     if haskey(ENV, "MOLLY_SHOW_PROGRESS")
         return parse(Bool, lowercase(ENV["MOLLY_SHOW_PROGRESS"]))
@@ -1118,8 +1165,11 @@ end
                            show_progress=default_show_progress(),
                            check_nans=default_check_nans(sys, sim),
                            rng=Random.default_rng(),
-                           strictness=default_strictness()) where T
+                           strictness=default_strictness(),
+                           use_cuda_graph::Bool=false,
+                           finite_check_every::Integer=20) where T
     check_simulate_inputs(init_step, run_loggers, strictness)
+    check_cuda_graph_legality(sys, use_cuda_graph)
     n_steps = calc_n_steps(n_steps_or_time, sim.dt)
     needs_vir, needs_vir_steps = needs_virial_schedule(sim.coupling, sys.loggers, run_loggers)
     sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
@@ -1139,6 +1189,16 @@ end
         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
                        n_threads=n_threads, strictness=strictness, current_forces=forces_t)
     else
+        # use_cuda_graph warm-up: force every BiasPotential's lazily-allocated buffer (grad,
+        # d_buf, fs_svec, dist_scratch, d_bias_buf) to materialize via one ordinary (uncaptured)
+        # forces! call before the step loop's first captured call -- CUDA graph capture disallows
+        # allocation inside the captured region (confirmed directly: an allocation on the first
+        # captured call, absent on the second once the buffer already exists, changes the
+        # captured kernel-launch topology between calls and makes CUDA's graph-update step fail
+        # with ERROR_GRAPH_EXEC_UPDATE_FAILURE). forces_t/accels_t are recomputed on the loop's
+        # first iteration regardless, so this call's own output isn't otherwise used.
+        use_cuda_graph && forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+                                  n_threads=n_threads)
         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
                        n_threads=n_threads, strictness=strictness)
     end
@@ -1166,8 +1226,22 @@ end
     progress = setup_progress(n_steps, show_progress)
     for step_n in (init_step + 1):(init_step + n_steps)
         needs_vir_step = needs_virial_on_step(needs_vir, needs_vir_steps, step_n)
-        forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step);
-                n_threads=n_threads)
+        # use_cuda_graph: capture only the steady-state step (no virial, no neighbor/tile
+        # refresh) -- both change forces!'s actual kernel-launch set, which would force a full
+        # graph re-instantiate every time either flips, defeating the optimisation. Those steps
+        # fall back to a plain (uncaptured) forces! call, same as use_cuda_graph=false throughout.
+        if use_cuda_graph && !needs_vir_step && !is_tile_refresh_step(sys, buffers, step_n)
+            captured_forces!(sys, forces_t, sys, neighbors, step_n, buffers, Val(false);
+                             n_threads=n_threads, cuda_graph_capturing=true)
+        else
+            forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step);
+                    n_threads=n_threads)
+        end
+        if use_cuda_graph && step_n % finite_check_every == 0
+            for inter in values(sys.general_inters)
+                inter isa BiasPotential && check_bias_finite_periodic(inter)
+            end
+        end
         accels_t .= calc_accels.(forces_t, masses(sys))
 
         sys.velocities .+= accels_t .* sim.dt

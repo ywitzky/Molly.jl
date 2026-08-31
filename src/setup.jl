@@ -1416,7 +1416,7 @@ function System(T, TH, AT, atoms, coords, boundary_used, velocities, atoms_data,
         end
     end
     if length(bonds_all_vs_is) > 0
-        topology = MolecularTopology(bonds_all_vs_is, bonds_all_vs_js, length(coords_dev))
+        topology = MolecularTopology(bonds_all_vs_is, bonds_all_vs_js, length(coords_dev); array_type=AT)
     else
         topology = nothing
     end
