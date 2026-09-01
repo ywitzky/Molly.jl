@@ -349,6 +349,249 @@ Molly.bias_gradient(::BiasNaNGradient, cv_sim) = NaN * u"kJ * mol^-1 * nm^-1"
 
 end
 
+@testset "Bias potentials" begin
+    c1 = SVector(1.0, 1.0, 1.0)u"nm"
+    c2 = SVector(1.3, 1.0, 1.0)u"nm"
+    c3 = SVector(1.4, 1.0, 1.0)u"nm"
+    c4 = SVector(1.1, 1.0, 1.0)u"nm"
+
+    a1 = Atom(mass=10u"g/mol", charge=1.0, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1")
+    a2 = Atom(mass=10u"g/mol", charge=1.0, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1")
+    a3 = Atom(mass=10u"g/mol", charge=1.0, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1")
+    a4 = Atom(mass=10u"g/mol", charge=1.0, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1")
+
+    boundary = CubicBoundary(2.0u"nm")
+
+    dr12 = vector(c1, c2, boundary)
+    dr13 = vector(c1, c3, boundary)
+    dr14 = vector(c1, c4, boundary)
+
+    atoms = [a1, a2, a3, a4]
+    coords = [c1, c2, c3, c4]
+    velocities = [random_velocity(10u"g/mol", 300u"K") for i in 1:length(atoms)]
+
+    sys = System(
+        atoms=atoms,
+        coords=coords,
+        boundary=boundary,
+        velocities=velocities,
+    )
+
+    lb = LinearBias(1500u"kJ * mol^-1 * nm^-1", 0.5u"nm")
+
+    cv_sim = 1u"nm"
+    @test isapprox(
+        potential_energy(lb, cv_sim),
+        750u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    cv_sim = 0.5u"nm"
+    @test isapprox(
+        potential_energy(lb, cv_sim),
+        0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    cv_sim = 1u"nm"
+    @test isapprox(
+        Molly.bias_gradient(lb, cv_sim),
+        1500u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    cv_sim = 0.1u"nm"
+    @test isapprox(
+        Molly.bias_gradient(lb, cv_sim),
+        -1500u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    cv_sim = 0.5u"nm"
+    @test Molly.bias_gradient(lb, cv_sim) == 0u"kJ * mol^-1 * nm^-1"
+
+    sb = SquareBias(3000u"kJ * mol^-1 * nm^-2", 0.75u"nm")
+
+    cv_sim = 1u"nm"
+    @test isapprox(
+        potential_energy(sb, cv_sim),
+        93.75u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    cv_sim = 0.75u"nm"
+    @test isapprox(
+        potential_energy(sb, cv_sim),
+        0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    cv_sim = 1u"nm"
+    @test isapprox(
+        Molly.bias_gradient(sb, cv_sim),
+        750u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    cv_sim = 0.1u"nm"
+    @test isapprox(
+        Molly.bias_gradient(sb, cv_sim),
+        -1950u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    cv_sim = 0.75u"nm"
+    @test isapprox(
+        Molly.bias_gradient(sb, cv_sim),
+        0u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    fb = FlatBottomSquareBias(3000u"kJ * mol^-1 * nm^-2", 0.5u"nm", 0.75u"nm")
+    @test_throws ArgumentError FlatBottomSquareBias(
+        3000u"kJ * mol^-1 * nm^-2",
+        -0.5u"nm",
+        0.75u"nm",
+    )
+    @test_throws ArgumentError FlatBottomSquareBias(
+        3000u"kJ * mol^-1 * nm^-2",
+        NaN * u"nm",
+        0.75u"nm",
+    )
+
+    cv_sim = 1.5u"nm"
+    @test isapprox(
+        potential_energy(fb, cv_sim),
+        93.75u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    cv_sim = 1u"nm"
+    @test isapprox(
+        potential_energy(fb, cv_sim),
+        0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    cv_sim = 1.5u"nm"
+    @test isapprox(
+        Molly.bias_gradient(fb, cv_sim),
+        750u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    cv_sim = 1u"nm"
+    @test isapprox(
+        Molly.bias_gradient(fb, cv_sim),
+        0u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    cv_sim = 0.75u"nm"
+    @test Molly.bias_gradient(fb, cv_sim) == 0u"kJ * mol^-1 * nm^-1"
+
+    calc_dist = CalcDist([1], [2], CalcSingleDist(), :wrap)
+
+    lb = LinearBias(7500u"kJ * mol^-1 * nm^-1", 0.5u"nm")
+    @test isapprox(
+        AtomsCalculators.potential_energy(sys, BiasPotential(calc_dist, lb)),
+        1500u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    sb = SquareBias(7500u"kJ * mol^-1 * nm^-2", 0.5u"nm")
+    @test isapprox(
+        AtomsCalculators.potential_energy(sys, BiasPotential(calc_dist, sb)),
+        150u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    fb = FlatBottomSquareBias(7500u"kJ * mol^-1 * nm^-2", 0.15u"nm", 0.5u"nm")
+    @test isapprox(
+        AtomsCalculators.potential_energy(sys, BiasPotential(calc_dist, fb)),
+        9.375u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1",
+    )
+
+    calc_dist = CalcDist([1], [2], CalcSingleDist(), :wrap)
+    lb = LinearBias(7500u"kJ * mol^-1 * nm^-1", 0.5u"nm")
+
+    fs = Molly.zero_forces(sys)
+    AtomsCalculators.forces!(fs, sys, BiasPotential(calc_dist, lb))
+    @test isapprox(
+        fs[1],
+        SVector(-7500, 0.0, 0.0)u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    @test isapprox(
+        fs[2],
+        SVector(7500, 0.0, 0.0)u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    @test isapprox(
+        fs[3],
+        SVector(0.0, 0.0, 0.0)u"kJ * mol^-1 * nm^-1";
+        atol=1e-9u"kJ * mol^-1 * nm^-1",
+    )
+
+    fs_bad = Molly.zero_forces(sys)
+    @test_throws ErrorException AtomsCalculators.forces!(
+        fs_bad,
+        sys,
+        BiasPotential(calc_dist, BiasNaNGradient()),
+    )
+
+    # PeriodicFlatBottomBias tests (Target: 0, Flat bottom width: 0.1)
+    pb = PeriodicFlatBottomBias(1000.0u"kJ * mol^-1", 0.1, 0.0)
+    @test pb.r_fb == 0.1
+    @test_throws ArgumentError PeriodicFlatBottomBias(1000.0u"kJ * mol^-1", -0.1, 0.0)
+    @test_throws ArgumentError PeriodicFlatBottomBias(1000.0u"kJ * mol^-1", NaN, 0.0)
+
+    # Inside flat region (no penalty)
+    cv_sim_in = 0.05
+    @test potential_energy(pb, cv_sim_in) == 0.0u"kJ * mol^-1"
+    @test Molly.bias_gradient(pb, cv_sim_in) == 0.0u"kJ * mol^-1"
+
+    # Outside region (harmonic penalty)
+    cv_sim_out = 0.2
+    # Energy: 0.5 * k * (dist - r_fb)^2 = 0.5 * 1000 * (0.2 - 0.1)^2 = 5.0
+    @test isapprox(
+        potential_energy(pb, cv_sim_out),
+        5.0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1"
+    )
+    # Gradient: k * (dist - r_fb) * sign(d_wrapped) = 1000 * 0.1 * 1 = 100.0
+    @test isapprox(
+        Molly.bias_gradient(pb, cv_sim_out),
+        100.0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1"
+    )
+
+    # Periodic wrapping test (Target 0, width 0.1, Input ~ -0.2)
+    cv_sim_wrap = 2π - 0.2
+    # Wrapped distance is 0.2, outside the flat bottom
+    @test isapprox(
+        potential_energy(pb, cv_sim_wrap),
+        5.0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1"
+    )
+    # Gradient should point towards the target (negative direction)
+    @test isapprox(
+        Molly.bias_gradient(pb, cv_sim_wrap),
+        -100.0u"kJ * mol^-1";
+        atol=1e-9u"kJ * mol^-1"
+    )
+
+    @test isapprox(
+        potential_energy(pb, π),
+        potential_energy(pb, -π);
+        atol=1e-9u"kJ * mol^-1",
+    )
+    @test Molly.bias_gradient(pb, π) == Molly.bias_gradient(pb, -π)
+    @test Molly.bias_gradient(pb, π) < 0u"kJ * mol^-1"
+end
 
 @testset "Bias correction and GPU" begin
     coords_uw = [SVector(1.95u"nm", 0.0u"nm", 0.0u"nm"), SVector(0.05u"nm", 0.0u"nm", 0.0u"nm"), SVector(0.15u"nm", 0.0u"nm", 0.0u"nm"),
