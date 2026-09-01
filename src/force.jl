@@ -540,6 +540,15 @@ mutable struct BuffersGPU{F, P, V, VN, KT, PT, C, M, R, IT, ITT, ITD, NIT, OIT, 
     constraint_preview_coords_buffer::Base.RefValue{Any}
     constraint_preview_velocities_buffer::Base.RefValue{Any}
     unwrapped_coords::Base.RefValue{Any}   # shared, once-per-step cache: see ensure_unwrapped_coords!
+    # Lazily-captured CuGraphExecs for Langevin's use_cuda_graph path -- captured exactly once
+    # (first use) and replayed via a bare launch on every subsequent call, never re-captured or
+    # updated for the life of one simulate! call (topology-changing steps already route around the
+    # captured path entirely via the existing needs_vir/is_tile_refresh_step fallback -- see
+    # captured_forces_once! in MollyCUDAExt.jl). Two separate graphs (not one) because the
+    # finite-check kernel only runs every finite_check_every steps; keeping it out of the
+    # steady-state graph means most steps launch a slightly smaller/cheaper graph.
+    graph_exec_no_check::Base.RefValue{Any}
+    graph_exec_with_check::Base.RefValue{Any}
     validity::BufferValidity
     box_mins::C
     box_maxs::C
@@ -582,7 +591,7 @@ function BuffersGPU(fs_mat, pe_vec_nounits, virial, virial_nounits, kin_tensor, 
                       pre_coupling_ref(), pre_coupling_ref(), pre_coupling_ref(),
                       constraint_scratch_ref(), constraint_scratch_ref(),
                       constraint_scratch_ref(), constraint_scratch_ref(),
-                      pre_coupling_ref(),
+                      pre_coupling_ref(), pre_coupling_ref(), pre_coupling_ref(),
                       BufferValidity(), box_mins, box_maxs, morton_seq,
                       morton_seq_buffer_1, morton_seq_buffer_2, morton_seq_inv,
                       compressed_masks, tile_is_clean, interacting_tiles_i,
@@ -705,7 +714,7 @@ function init_buffers!(sys::System{D, <:AbstractGPUArray, T, TH}, n_threads,
                       kin, pres, pre_coupling_ref(), pre_coupling_ref(),
                       pre_coupling_ref(), constraint_scratch_ref(), constraint_scratch_ref(),
                       constraint_scratch_ref(), constraint_scratch_ref(),
-                      pre_coupling_ref(),
+                      pre_coupling_ref(), pre_coupling_ref(), pre_coupling_ref(),
                       BufferValidity(), box_mins, box_maxs, morton_seq,
                       morton_seq_buffer_1, morton_seq_buffer_2, morton_seq_inv,
                       compressed_masks, tile_is_clean, interacting_tiles_i,
@@ -722,6 +731,13 @@ zero_forces(sys) = ustrip_vec.(zero(sys.coords)) .* sys.force_units
 # simulate!'s step loop (src/simulators.jl, use_cuda_graph=true, Langevin only for now) instead of
 # calling forces! directly, so the same call site works whether or not graph capture applies.
 captured_forces!(sys, args...; kwargs...) = forces!(args...; kwargs...)
+
+# Generic fallback for captured_forces_once! (see ext/MollyCUDAExt.jl for the actual CUDA
+# capture-once implementation): drops the CUDA-only `do_check` kwarg and calls forces! directly.
+# Reached only on non-GPU backends, which check_cuda_graph_legality (src/simulators.jl) already
+# excludes from the use_cuda_graph=true path entirely -- kept only so the call site in simulate!'s
+# step loop doesn't need its own backend branch.
+captured_forces_once!(sys, args...; do_check::Bool=true, kwargs...) = forces!(args...; kwargs...)
 
 # Whether this step is one where the GPU neighbor/tile list is refreshed -- refresh does a host
 # sync that sizes the next kernel launch's grid (ext/MollyCUDAExt.jl's
@@ -1287,7 +1303,9 @@ function forces!(fs,
                  pairwise_inters=sys.pairwise_inters,
                  specific_inter_lists=sys.specific_inter_lists,
                  general_inters=sys.general_inters,
-                 cuda_graph_capturing::Bool=false) where {D, T, TH, needs_vir}
+                 cuda_graph_capturing::Bool=false,
+                 defer_finite_check::Bool=false,
+                 bias_check::Bool=true) where {D, T, TH, needs_vir}
     if needs_vir
         fill!(buffers.virial, zero(T) * sys.energy_units)
         fill!(buffers.virial_nounits, zero(TH))
@@ -1329,10 +1347,34 @@ function forces!(fs,
     if any(bias_needs_unwrap, values(general_inters))
         ensure_unwrapped_coords!(buffers, sys, step_n)
     end
-    for inter in values(general_inters)
-        AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
-                                 n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
-                                 cuda_graph_capturing=cuda_graph_capturing)
+    if cuda_graph_capturing
+        # Batches every attached BiasPotential's captured-path tail (fs_svec = d_bias_buf .*
+        # grad; fs -= fs_svec, plus fs_svec's finite check) into 2 kernel launches total instead
+        # of 2*n_bias -- see bias_cv_step!/bias_batched_tail! (src/bias/bias.jl). Each bias still
+        # runs its own CV-type-specific cv_gradient! separately (bias_cv_step!, unbatchable); any
+        # non-BiasPotential general_inters entry is left on its current, unbatched
+        # AtomsCalculators.forces! call, run after all biases (order between biases and other
+        # general_inters entries is not preserved -- force accumulation is commutative up to
+        # floating-point rounding, and no non-bias GPU-capturable general_inters type exists yet).
+        biases, other_inters = split_biases(values(general_inters))
+        for bias in biases
+            coords = bias_coords(sys, bias.cv_type, buffers, step_n)
+            bias_cv_step!(bias, sys, coords, fs, step_n, bias_check)
+        end
+        bias_batched_tail!(fs, biases, step_n, bias_check)
+        for inter in other_inters
+            AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
+                                     n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
+                                     cuda_graph_capturing=cuda_graph_capturing,
+                                     defer_finite_check=defer_finite_check)
+        end
+    else
+        for inter in values(general_inters)
+            AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
+                                     n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
+                                     cuda_graph_capturing=cuda_graph_capturing,
+                                     defer_finite_check=defer_finite_check)
+        end
     end
     distribute_forces!(fs, sys, buffers)
 

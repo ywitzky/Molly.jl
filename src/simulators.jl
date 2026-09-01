@@ -1198,7 +1198,7 @@ end
         # with ERROR_GRAPH_EXEC_UPDATE_FAILURE). forces_t/accels_t are recomputed on the loop's
         # first iteration regardless, so this call's own output isn't otherwise used.
         use_cuda_graph && forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
-                                  n_threads=n_threads)
+                                  n_threads=n_threads, defer_finite_check=true)
         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
                        n_threads=n_threads, strictness=strictness)
     end
@@ -1230,17 +1230,25 @@ end
         # refresh) -- both change forces!'s actual kernel-launch set, which would force a full
         # graph re-instantiate every time either flips, defeating the optimisation. Those steps
         # fall back to a plain (uncaptured) forces! call, same as use_cuda_graph=false throughout.
+        do_check = use_cuda_graph && step_n % finite_check_every == 0
         if use_cuda_graph && !needs_vir_step && !is_tile_refresh_step(sys, buffers, step_n)
-            captured_forces!(sys, forces_t, sys, neighbors, step_n, buffers, Val(false);
-                             n_threads=n_threads, cuda_graph_capturing=true)
+            # captured_forces_once! (not captured_forces!/@captured): captures each of 2 graphs
+            # (no-check / with-check, selected by do_check) exactly once and replays via a bare
+            # launch on every later call -- see captured_forces_once!'s docstring (MollyCUDAExt.jl)
+            # for why this is safe here specifically (topology is fixed for the life of this
+            # simulate! call) and ~4x cheaper than @captured's per-call re-capture+update.
+            captured_forces_once!(sys, forces_t, sys, neighbors, step_n, buffers, Val(false);
+                                  n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true,
+                                  do_check=do_check)
         else
             forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step);
-                    n_threads=n_threads)
+                    n_threads=n_threads, defer_finite_check=use_cuda_graph)
         end
-        if use_cuda_graph && step_n % finite_check_every == 0
-            for inter in values(sys.general_inters)
-                inter isa BiasPotential && check_bias_finite_periodic(inter)
-            end
+        if do_check
+            # One host sync for every attached BiasPotential's bad_step at once, instead of
+            # n_bias separate from_device round trips (each pays a fixed tens-of-microseconds
+            # sync cost regardless of payload size) -- see check_bias_finite_periodic_batched!.
+            check_bias_finite_periodic_batched!(values(sys.general_inters))
         end
         accels_t .= calc_accels.(forces_t, masses(sys))
 

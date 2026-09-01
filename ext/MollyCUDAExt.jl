@@ -899,8 +899,57 @@ end
 # (src/simulators.jl) has already verified every precondition holds (GPU-resident System, no
 # CalcRMSD/custom-CV/:pbc-correction BiasPotential, no virtual sites/constraints), and the caller
 # has already excluded virial/tile-refresh steps (is_tile_refresh_step above).
+#
+# Kept as-is (not the entry point Langevin's simulate! actually uses any more -- see
+# captured_forces_once! below) because @captured's automatic re-capture-on-topology-change is a
+# useful safety net for any *other* caller of captured_forces! that doesn't have simulate!'s own
+# topology-change handling (needs_vir/is_tile_refresh_step fallback).
 function Molly.captured_forces!(sys::System{D, <:CuArray, T}, args...; kwargs...) where {D, T}
     @captured Molly.forces!(args...; kwargs...)
+    return nothing
+end
+
+# Captures forces!'s steady-state kernel-launch sequence exactly ONCE (first call for a given
+# `buffers`/`do_check` combination), then just CUDA.launch()s the cached CuGraphExec on every
+# subsequent call -- no per-call re-capture, no cuGraphExecUpdate. Confirmed via an isolated
+# micro-benchmark that @captured's per-call record+update is ~4x more expensive than a pure
+# graph-replay launch at realistic (10+) kernel counts -- @captured's convenience (automatic
+# re-capture on topology or argument-count change) isn't needed here because simulate!'s step loop
+# already routes every topology-changing step (needs_vir, is_tile_refresh_step) around the
+# captured path entirely (see simulators.jl), so the topology this graph represents is fixed for
+# the entire life of one simulate! call.
+#
+# `do_check` (kwarg, defaults true) selects which of the two graphs (cached separately in
+# buffers.graph_exec_no_check/graph_exec_with_check) to use -- see bias_cv_step!/bias_batched_tail!
+# (src/bias/bias.jl) for why the finite-check kernels can't be in the same graph as the
+# steady-state-only path: they take step_n as a plain kernel argument, which would be frozen at
+# whatever value was current on the ONE call that captured the graph. The with-check graph is
+# therefore always captured using a fixed sentinel step_n (not the real one) -- simulate!'s step
+# loop already only reports "somewhere since the last finite check" on failure, not an exact step,
+# to match (see simulators.jl).
+#
+# Called exactly like captured_forces!: captured_forces_once!(sys, fs, sys, neighbors, step_n,
+# buffers, Val(needs_vir); kwargs..., do_check=...) -- args here is (fs, sys, neighbors, step_n,
+# buffers, Val(needs_vir)), matching Molly.forces!'s own positional order, so args[4]/args[5] are
+# step_n/buffers.
+const BIAS_FINITE_CHECK_SENTINEL_STEP = 1
+
+function Molly.captured_forces_once!(sys::System{D, <:CuArray, T}, args...;
+                                      do_check::Bool=true, kwargs...) where {D, T}
+    buffers = args[5]
+    cache_ref = do_check ? buffers.graph_exec_with_check : buffers.graph_exec_no_check
+    if cache_ref[] === nothing
+        capture_kwargs = (; kwargs..., bias_check=do_check)
+        # Fixed to the sentinel only for the capture call itself, so the captured graph never has
+        # the real, call-specific step_n baked into a kernel argument.
+        capture_args = do_check ?
+            (args[1:3]..., BIAS_FINITE_CHECK_SENTINEL_STEP, args[5:end]...) : args
+        graph = CUDA.capture() do
+            Molly.forces!(capture_args...; capture_kwargs...)
+        end
+        cache_ref[] = CUDA.instantiate(graph)
+    end
+    CUDA.launch(cache_ref[]::CuGraphExec)
     return nothing
 end
 
