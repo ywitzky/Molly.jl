@@ -67,12 +67,15 @@ function check_cuda_graph_legality(sys, use_cuda_graph::Bool)
             error("use_cuda_graph=true is not supported for CalcRMSD: its Kabsch alignment " *
                   "requires a host SVD every call, which cannot be captured.")
         end
-        if inter.cv_type isa CalcDist{<:Union{CalcMinDist, CalcMaxDist}}
-            error("use_cuda_graph=true is not supported for CalcMinDist/CalcMaxDist: their " *
-                  "extremal-pair search returns a host index via findmin/findmax every call " *
-                  "(confirmed directly: this raises a device-side exception when it runs " *
-                  "inside a captured region), which cannot be captured.")
-        end
+        # CalcMinDist/CalcMaxDist ARE supported: their persistent-scratch (MinMaxScratch) path
+        # (mindist_calculate_cv_fused!/mindist_gradient_fused!, cv.jl) finds the winning pair via a
+        # fully device-resident tile-reduce + bounded serial finalize, no findmin/findmax/host sync
+        # at all -- that's what BiasPotential's captured path (bias_cv_step!) always uses. The only
+        # host sync in the MinMaxScratch path is ExtremalPairCache's from_device readback, gated
+        # behind `extremal_cache !== nothing` and only actually populated by calculate_virial!'s
+        # (needs_vir) reuse -- bias_cv_step! passes extremal_cache=nothing, so it's never reached
+        # inside a captured region regardless (needs_vir steps are already excluded from capture
+        # entirely, same as any other CV type here).
         if inter.cv_type.correction == :pbc
             error("use_cuda_graph=true is not supported for a BiasPotential with " *
                   "correction=:pbc: unwrap_molecules allocates GPU memory every call, which " *
@@ -1197,8 +1200,22 @@ end
         # captured kernel-launch topology between calls and makes CUDA's graph-update step fail
         # with ERROR_GRAPH_EXEC_UPDATE_FAILURE). forces_t/accels_t are recomputed on the loop's
         # first iteration regardless, so this call's own output isn't otherwise used.
-        use_cuda_graph && forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
-                                  n_threads=n_threads, defer_finite_check=true)
+        #
+        # A second warm-up call, with cuda_graph_capturing=true, is also required: that flag
+        # alone doesn't start capture (only CUDA.capture()/captured_forces_once! does), but it
+        # DOES select bias_cv_step!/bias_batched_tail!'s kernels (src/bias/bias.jl), which the
+        # plain call above never reaches (only the cuda_graph_capturing=true branch does). Without
+        # this, a completely fresh process's first REAL captured call is also the first time those
+        # kernels are ever JIT-compiled -- and compiling (cuModuleLoadDataEx) is itself a CUDA API
+        # call, which is illegal while stream-capturing (confirmed directly: this raises
+        # ERROR_STREAM_CAPTURE_UNSUPPORTED). Calling it here, uncaptured, forces that compilation
+        # to happen before capture ever starts.
+        if use_cuda_graph
+            forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+                   n_threads=n_threads, defer_finite_check=true)
+            forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+                   n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true)
+        end
         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
                        n_threads=n_threads, strictness=strictness)
     end

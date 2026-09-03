@@ -568,8 +568,16 @@ function bias_cv_step!(bias::BiasPotential, sys, coords, fs, step_n, do_check::B
     # allocated -- see simulate!'s warm-up call (src/simulators.jl) for the same reasoning applied
     # to bias.grad/d_buf/d_bias_buf.
     ensure_bias_finite_buffer!(bias)
+    # extremal_cache=nothing (not bias.extremal_cache): the captured path never calls
+    # calculate_virial! (needs_vir is excluded from the captured region entirely -- see
+    # simulators.jl), so nothing here ever reads bias.extremal_cache back. Passing the real cache
+    # would trigger mindist_gradient_fused!'s from_device readback (see its docstring, cv.jl) on
+    # every captured step for CalcMinDist/CalcMaxDist -- a host sync inside a captured region,
+    # illegal and pointless since the result is discarded. The ordinary (non-captured) forces!
+    # path below still passes the real cache, since that path's own needs_vir branch is what
+    # consumes it.
     cv_gradient!(bias.grad, bias.d_buf, bias.cv_type, coords, sys.atoms, sys.boundary, sys.velocities;
-                extremal_cache=bias.extremal_cache, scratch=bias.dist_scratch)
+                extremal_cache=nothing, scratch=bias.dist_scratch)
     if do_check
         check_bias_finite_deferred!(bias.d_buf, bias, step_n)
         check_bias_finite_deferred!(bias.grad, bias, step_n)
