@@ -1397,3 +1397,74 @@ function forces!(fs,
 
     return fs, buffers
 end
+
+"""
+    warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers, use_cuda_graph;
+                               n_threads)
+
+Force every `BiasPotential`'s lazily-allocated buffer (grad, d_buf, fs_svec, dist_scratch,
+d_bias_buf) to materialize, and every captured-path kernel (`bias_cv_step!`/`bias_batched_tail!`,
+`src/bias/bias.jl`) to JIT-compile, before the step loop's first captured call. CUDA graph capture
+disallows both allocation and kernel compilation inside the captured region: an allocation on the
+first captured call (absent once the buffer already exists) changes the captured kernel-launch
+topology between calls and makes CUDA's graph-update step fail with
+`ERROR_GRAPH_EXEC_UPDATE_FAILURE`, while compiling (`cuModuleLoadDataEx`) mid-capture raises
+`ERROR_STREAM_CAPTURE_UNSUPPORTED`. The plain (non-capturing) call only reaches ordinary forces
+kernels, not the captured-path bias kernels -- hence two calls. Neither call's own force output is
+used; `forces_t`/`accels_t` are recomputed on the loop's first iteration regardless.
+"""
+@inline function warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers,
+                                            use_cuda_graph; n_threads)
+    if use_cuda_graph
+        forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+               n_threads=n_threads, defer_finite_check=true)
+        forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+               n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true)
+    end
+    return nothing
+end
+
+"""
+    forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step, Val(use_cuda_graph),
+                has_bias_potential, finite_check_every; n_threads)
+
+Compute one step's forces, routing internally to the captured (`captured_forces_once!`) or plain
+(`forces!`) path so the step loop doesn't have to re-derive the routing condition itself. Only the
+steady-state case (`use_cuda_graph=true`, no virial needed, not a tile-refresh step) goes through
+the captured path; every other case -- including `use_cuda_graph=false` entirely -- falls back to a
+plain `forces!` call, same as before this wrapper existed. See `captured_forces_once!`'s docstring
+(`ext/MollyCUDAExt.jl`) for why the captured path is safe and cheap specifically here (topology
+fixed for the life of one `simulate!` call, tile refreshes invalidate the cache themselves).
+
+Also runs the deferred `BiasPotential` finiteness check (`check_bias_finite_periodic_batched!`)
+whenever it's due (every `finite_check_every` steps, and only when `use_cuda_graph` and at least
+one `BiasPotential` is attached -- captured steps defer this check instead of doing it inline like
+the normal, uncaptured force path does) -- see that function's docstring (`src/bias/bias.jl`) for
+why this needs to be batched and periodic rather than per-bias and per-step.
+"""
+@inline function forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step,
+                              ::Val{false}, has_bias_potential, finite_check_every; n_threads)
+    forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step); n_threads=n_threads,
+           defer_finite_check=false)
+    return nothing
+end
+
+@inline function forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step,
+                              ::Val{true}, has_bias_potential, finite_check_every; n_threads)
+    run_bias_finite_check = has_bias_potential && step_n % finite_check_every == 0
+    if !needs_vir_step && !is_tile_refresh_step(sys, buffers, step_n)
+        captured_forces_once!(forces_t, sys, neighbors, step_n, buffers, Val(false);
+                              n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true,
+                              do_check=run_bias_finite_check)
+    else
+        forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step);
+               n_threads=n_threads, defer_finite_check=true)
+    end
+    if run_bias_finite_check
+        # One host sync for every attached BiasPotential's bad_step at once, instead of n_bias
+        # separate from_device round trips (each pays a fixed tens-of-microseconds sync cost
+        # regardless of payload size) -- see check_bias_finite_periodic_batched!.
+        check_bias_finite_periodic_batched!(values(sys.general_inters))
+    end
+    return nothing
+end
