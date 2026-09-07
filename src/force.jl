@@ -1444,8 +1444,7 @@ why this needs to be batched and periodic rather than per-bias and per-step.
 """
 @inline function forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step,
                               ::Val{false}, has_bias_potential, finite_check_every; n_threads)
-    forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step); n_threads=n_threads,
-           defer_finite_check=false)
+    forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step); n_threads=n_threads)
     return nothing
 end
 
