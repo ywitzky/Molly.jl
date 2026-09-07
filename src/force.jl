@@ -540,13 +540,16 @@ mutable struct BuffersGPU{F, P, V, VN, KT, PT, C, M, R, IT, ITT, ITD, NIT, OIT, 
     constraint_preview_coords_buffer::Base.RefValue{Any}
     constraint_preview_velocities_buffer::Base.RefValue{Any}
     unwrapped_coords::Base.RefValue{Any}   # shared, once-per-step cache: see ensure_unwrapped_coords!
-    # Lazily-captured CuGraphExecs for Langevin's use_cuda_graph path -- captured exactly once
-    # (first use) and replayed via a bare launch on every subsequent call, never re-captured or
-    # updated for the life of one simulate! call (topology-changing steps already route around the
-    # captured path entirely via the existing needs_vir/is_tile_refresh_step fallback -- see
-    # captured_forces_once! in MollyCUDAExt.jl). Two separate graphs (not one) because the
-    # finite-check kernel only runs every finite_check_every steps; keeping it out of the
-    # steady-state graph means most steps launch a slightly smaller/cheaper graph.
+    # Lazily-captured CuGraphExecs for Langevin's use_cuda_graph path -- captured once and replayed
+    # via a bare launch on every later call, until invalidated. Needs_vir steps already route
+    # around the captured path entirely (see captured_forces_once! in MollyCUDAExt.jl); a tile
+    # refresh instead resets these Refs to nothing (invalidate_cuda_graph_cache!, called from
+    # pairwise_forces_loop_gpu! wherever needs_tile_refresh fires) because it changes
+    # buffers.num_pairs, which sizes the pairwise kernel's launch grid -- a graph captured before a
+    # refresh has that grid frozen in and would replay against a differently-sized tile list.
+    # Two separate graphs (not one) because the finite-check kernel only runs every
+    # finite_check_every steps; keeping it out of the steady-state graph means most steps launch a
+    # slightly smaller/cheaper graph.
     graph_exec_no_check::Base.RefValue{Any}
     graph_exec_with_check::Base.RefValue{Any}
     validity::BufferValidity
@@ -727,23 +730,30 @@ end
 zero_forces(sys) = ustrip_vec.(zero(sys.coords)) .* sys.force_units
 
 # Generic fallback: no graph capture, just calls forces! directly. Overridden for a CuArray-backed
-# System in ext/MollyCUDAExt.jl with an actual CUDA.@captured-wrapped body. Called from
-# simulate!'s step loop (src/simulators.jl, use_cuda_graph=true, Langevin only for now) instead of
-# calling forces! directly, so the same call site works whether or not graph capture applies.
-captured_forces!(sys, args...; kwargs...) = forces!(args...; kwargs...)
+# System (dispatched on the sys argument itself, forces!'s own 2nd positional argument) in
+# ext/MollyCUDAExt.jl with an actual CUDA.@captured-wrapped body. Called from simulate!'s step loop
+# (src/simulators.jl, use_cuda_graph=true, Langevin only for now) instead of calling forces!
+# directly, so the same call site works whether or not graph capture applies.
+captured_forces!(fs, sys, args...; kwargs...) = forces!(fs, sys, args...; kwargs...)
 
 # Generic fallback for captured_forces_once! (see ext/MollyCUDAExt.jl for the actual CUDA
 # capture-once implementation): drops the CUDA-only `do_check` kwarg and calls forces! directly.
 # Reached only on non-GPU backends, which check_cuda_graph_legality (src/simulators.jl) already
 # excludes from the use_cuda_graph=true path entirely -- kept only so the call site in simulate!'s
 # step loop doesn't need its own backend branch.
-captured_forces_once!(sys, args...; do_check::Bool=true, kwargs...) = forces!(args...; kwargs...)
+captured_forces_once!(fs, sys, args...; do_check::Bool=true, kwargs...) = forces!(fs, sys, args...; kwargs...)
 
 # Whether this step is one where the GPU neighbor/tile list is refreshed -- refresh does a host
 # sync that sizes the next kernel launch's grid (ext/MollyCUDAExt.jl's
 # gpu_neighbor_refresh_flags/refresh_interacting_tiles!), which cannot sit inside a captured CUDA
 # graph. Generic fallback (CPU, or no neighbor finder needing this distinction): always false.
 is_tile_refresh_step(sys, buffers, step_n::Integer) = false
+
+# Drops any cached CuGraphExec so the next captured_forces_once! call recaptures instead of
+# replaying a graph whose kernel-launch grid was sized for a since-changed tile list. Called from
+# pairwise_forces_loop_gpu! (ext/MollyCUDAExt.jl) itself, right where a tile refresh is decided and
+# performed, rather than re-derived by the caller. Generic fallback: a no-op (no cache exists).
+invalidate_cuda_graph_cache!(buffers) = nothing
 
 """
     forces(system, neighbors=find_neighbors(system), step_n=0;

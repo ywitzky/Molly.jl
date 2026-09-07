@@ -1158,6 +1158,32 @@ function Langevin(; dt, temperature, friction, coupling=nothing, remove_CM_motio
                     vel_scale, noise_scale)
 end
 
+"""
+    warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers, use_cuda_graph;
+                               n_threads)
+
+Force every `BiasPotential`'s lazily-allocated buffer (grad, d_buf, fs_svec, dist_scratch,
+d_bias_buf) to materialize, and every captured-path kernel (`bias_cv_step!`/`bias_batched_tail!`,
+`src/bias/bias.jl`) to JIT-compile, before the step loop's first captured call. CUDA graph capture
+disallows both allocation and kernel compilation inside the captured region: an allocation on the
+first captured call (absent once the buffer already exists) changes the captured kernel-launch
+topology between calls and makes CUDA's graph-update step fail with
+`ERROR_GRAPH_EXEC_UPDATE_FAILURE`, while compiling (`cuModuleLoadDataEx`) mid-capture raises
+`ERROR_STREAM_CAPTURE_UNSUPPORTED`. The plain (non-capturing) call only reaches ordinary forces
+kernels, not the captured-path bias kernels -- hence two calls. Neither call's own force output is
+used; `forces_t`/`accels_t` are recomputed on the loop's first iteration regardless.
+"""
+@inline function warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers,
+                                            use_cuda_graph; n_threads)
+    if use_cuda_graph
+        forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+               n_threads=n_threads, defer_finite_check=true)
+        forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
+               n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true)
+    end
+    return nothing
+end
+
 @inline function simulate!(sys::System{<:Any, <:Any, T},
                            sim::Langevin,
                            n_steps_or_time;
@@ -1192,30 +1218,8 @@ end
         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
                        n_threads=n_threads, strictness=strictness, current_forces=forces_t)
     else
-        # use_cuda_graph warm-up: force every BiasPotential's lazily-allocated buffer (grad,
-        # d_buf, fs_svec, dist_scratch, d_bias_buf) to materialize via one ordinary (uncaptured)
-        # forces! call before the step loop's first captured call -- CUDA graph capture disallows
-        # allocation inside the captured region (confirmed directly: an allocation on the first
-        # captured call, absent on the second once the buffer already exists, changes the
-        # captured kernel-launch topology between calls and makes CUDA's graph-update step fail
-        # with ERROR_GRAPH_EXEC_UPDATE_FAILURE). forces_t/accels_t are recomputed on the loop's
-        # first iteration regardless, so this call's own output isn't otherwise used.
-        #
-        # A second warm-up call, with cuda_graph_capturing=true, is also required: that flag
-        # alone doesn't start capture (only CUDA.capture()/captured_forces_once! does), but it
-        # DOES select bias_cv_step!/bias_batched_tail!'s kernels (src/bias/bias.jl), which the
-        # plain call above never reaches (only the cuda_graph_capturing=true branch does). Without
-        # this, a completely fresh process's first REAL captured call is also the first time those
-        # kernels are ever JIT-compiled -- and compiling (cuModuleLoadDataEx) is itself a CUDA API
-        # call, which is illegal while stream-capturing (confirmed directly: this raises
-        # ERROR_STREAM_CAPTURE_UNSUPPORTED). Calling it here, uncaptured, forces that compilation
-        # to happen before capture ever starts.
-        if use_cuda_graph
-            forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
-                   n_threads=n_threads, defer_finite_check=true)
-            forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
-                   n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true)
-        end
+        warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers, use_cuda_graph;
+                                   n_threads=n_threads)
         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
                        n_threads=n_threads, strictness=strictness)
     end
@@ -1254,7 +1258,7 @@ end
             # launch on every later call -- see captured_forces_once!'s docstring (MollyCUDAExt.jl)
             # for why this is safe here specifically (topology is fixed for the life of this
             # simulate! call) and ~4x cheaper than @captured's per-call re-capture+update.
-            captured_forces_once!(sys, forces_t, sys, neighbors, step_n, buffers, Val(false);
+            captured_forces_once!(forces_t, sys, neighbors, step_n, buffers, Val(false);
                                   n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true,
                                   do_check=do_check)
         else
