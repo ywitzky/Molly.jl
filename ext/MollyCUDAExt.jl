@@ -2035,7 +2035,7 @@ function force_kernel!(
     stage_off = 32 * D * by * sizeof(T)
     sh_stage = @inbounds CuDynamicSharedArray(JT, (32, by), stage_off)
     stage_off_v = stage_off + 32 * by * sizeof(JT)
-    sh_vel = @inbounds CuDynamicSharedArray(eltype(velocities_var), (32, by), stage_off_v)
+    sh_vel = @inbounds CuDynamicSharedArray(eltype(velocities_var), (32, uses_vel ? by : 0), stage_off_v)
 
     r = Int32((N - 1) % 32 + 1)
     
@@ -2537,7 +2537,7 @@ function energy_kernel!(
     JT = JStage{eltype(coords_var), P}
     sh_stage = @inbounds CuDynamicSharedArray(JT, (32, by))
     stage_off_v = 32 * by * sizeof(JT)
-    sh_vel = @inbounds CuDynamicSharedArray(eltype(velocities_var), (32, by), stage_off_v)
+    sh_vel = @inbounds CuDynamicSharedArray(eltype(velocities_var), (32, uses_vel ? by : 0), stage_off_v)
 
     r = Int32((N - 1) % 32 + 1)
 
