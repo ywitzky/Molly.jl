@@ -300,15 +300,16 @@ function has_interaction_virial(buffers, step_n::Integer)
     return has_interaction_virial(buffers.validity, step_n)
 end
 
-# Whether a general_inters entry needs `sys`'s bonded-molecule-unwrapped coordinates for this
-# step (only true for a BiasPotential whose CV has correction==:pbc, src/bias/bias.jl) -- the
-# generic fallback covers every other interaction type, which never needs this.
+# Whether a general_inters entry needs sys's unwrapped coordinates this step (true only for a
+# BiasPotential with correction==:pbc, src/bias/bias.jl).
 bias_needs_unwrap(inter) = false
 
-# Computes unwrap_molecules(sys) at most once per step_n and caches it on `buffers`, so every
-# attached BiasPotential needing correction==:pbc shares one computation instead of each
-# independently recomputing it (a real, previously-happening N-fold redundancy for N
-# simultaneously-attached :pbc-correction CVs).
+"""
+    ensure_unwrapped_coords!(buffers, sys, step_n)
+
+`unwrap_molecules(sys)`, computed at most once per `step_n` and cached on `buffers` so every
+attached `BiasPotential` with `correction==:pbc` shares it instead of recomputing independently.
+"""
 function ensure_unwrapped_coords!(buffers, sys, step_n::Integer)
     if !has_unwrap(buffers.validity, step_n)
         buffers.unwrapped_coords[] = unwrap_molecules(sys)
@@ -540,16 +541,7 @@ mutable struct BuffersGPU{F, P, V, VN, KT, PT, C, M, R, IT, ITT, ITD, NIT, OIT, 
     constraint_preview_coords_buffer::Base.RefValue{Any}
     constraint_preview_velocities_buffer::Base.RefValue{Any}
     unwrapped_coords::Base.RefValue{Any}   # shared, once-per-step cache: see ensure_unwrapped_coords!
-    # Lazily-captured CuGraphExecs for Langevin's use_cuda_graph path -- captured once and replayed
-    # via a bare launch on every later call, until invalidated. Needs_vir steps already route
-    # around the captured path entirely (see captured_forces_once! in MollyCUDAExt.jl); a tile
-    # refresh instead resets these Refs to nothing (invalidate_cuda_graph_cache!, called from
-    # pairwise_forces_loop_gpu! wherever needs_tile_refresh fires) because it changes
-    # buffers.num_pairs, which sizes the pairwise kernel's launch grid -- a graph captured before a
-    # refresh has that grid frozen in and would replay against a differently-sized tile list.
-    # Two separate graphs (not one) because the finite-check kernel only runs every
-    # finite_check_every steps; keeping it out of the steady-state graph means most steps launch a
-    # slightly smaller/cheaper graph.
+    # Cached CuGraphExecs for use_cuda_graph (see captured_forces_once!, MollyCUDAExt.jl); 
     graph_exec_no_check::Base.RefValue{Any}
     graph_exec_with_check::Base.RefValue{Any}
     validity::BufferValidity
@@ -729,30 +721,19 @@ end
 
 zero_forces(sys) = ustrip_vec.(zero(sys.coords)) .* sys.force_units
 
-# Generic fallback: no graph capture, just calls forces! directly. Overridden for a CuArray-backed
-# System (dispatched on the sys argument itself, forces!'s own 2nd positional argument) in
-# ext/MollyCUDAExt.jl with an actual CUDA.@captured-wrapped body. Called from simulate!'s step loop
-# (src/simulators.jl, use_cuda_graph=true, Langevin only for now) instead of calling forces!
-# directly, so the same call site works whether or not graph capture applies.
+# Generic (CPU) fallback: calls forces! directly. Overridden for CuArray systems in
+# MollyCUDAExt.jl with a CUDA.@captured-wrapped body
 captured_forces!(fs, sys, args...; kwargs...) = forces!(fs, sys, args...; kwargs...)
 
-# Generic fallback for captured_forces_once! (see ext/MollyCUDAExt.jl for the actual CUDA
-# capture-once implementation): drops the CUDA-only `do_check` kwarg and calls forces! directly.
-# Reached only on non-GPU backends, which check_cuda_graph_legality (src/simulators.jl) already
-# excludes from the use_cuda_graph=true path entirely -- kept only so the call site in simulate!'s
-# step loop doesn't need its own backend branch.
+# Generic fallback for the real capture-once path (MollyCUDAExt.jl); drops the GPU-only `do_check`
+# kwarg and calls forces! directly. Only reached on backends check_cuda_graph_legality already
+# excludes from use_cuda_graph=true.
 captured_forces_once!(fs, sys, args...; do_check::Bool=true, kwargs...) = forces!(fs, sys, args...; kwargs...)
 
-# Whether this step is one where the GPU neighbor/tile list is refreshed -- refresh does a host
-# sync that sizes the next kernel launch's grid (ext/MollyCUDAExt.jl's
-# gpu_neighbor_refresh_flags/refresh_interacting_tiles!), which cannot sit inside a captured CUDA
-# graph. Generic fallback (CPU, or no neighbor finder needing this distinction): always false.
+# Whether this step refreshes the GPU tile list. Generic fallback: always false.
 is_tile_refresh_step(sys, buffers, step_n::Integer) = false
 
-# Drops any cached CuGraphExec so the next captured_forces_once! call recaptures instead of
-# replaying a graph whose kernel-launch grid was sized for a since-changed tile list. Called from
-# pairwise_forces_loop_gpu! (ext/MollyCUDAExt.jl) itself, right where a tile refresh is decided and
-# performed, rather than re-derived by the caller. Generic fallback: a no-op (no cache exists).
+# Generic fallback for CuGraph invalidation: a no-op.
 invalidate_cuda_graph_cache!(buffers) = nothing
 
 """
@@ -1358,14 +1339,7 @@ function forces!(fs,
         ensure_unwrapped_coords!(buffers, sys, step_n)
     end
     if cuda_graph_capturing
-        # Batches every attached BiasPotential's captured-path tail (fs_svec = d_bias_buf .*
-        # grad; fs -= fs_svec, plus fs_svec's finite check) into 2 kernel launches total instead
-        # of 2*n_bias -- see bias_cv_step!/bias_batched_tail! (src/bias/bias.jl). Each bias still
-        # runs its own CV-type-specific cv_gradient! separately (bias_cv_step!, unbatchable); any
-        # non-BiasPotential general_inters entry is left on its current, unbatched
-        # AtomsCalculators.forces! call, run after all biases (order between biases and other
-        # general_inters entries is not preserved -- force accumulation is commutative up to
-        # floating-point rounding, and no non-bias GPU-capturable general_inters type exists yet).
+        # Batches all biases' captured-path tail into 2 launches instead of 2*n_bias.
         biases, other_inters = split_biases(values(general_inters))
         for bias in biases
             coords = bias_coords(sys, bias.cv_type, buffers, step_n)
@@ -1402,16 +1376,10 @@ end
     warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers, use_cuda_graph;
                                n_threads)
 
-Force every `BiasPotential`'s lazily-allocated buffer (grad, d_buf, fs_svec, dist_scratch,
-d_bias_buf) to materialize, and every captured-path kernel (`bias_cv_step!`/`bias_batched_tail!`,
-`src/bias/bias.jl`) to JIT-compile, before the step loop's first captured call. CUDA graph capture
-disallows both allocation and kernel compilation inside the captured region: an allocation on the
-first captured call (absent once the buffer already exists) changes the captured kernel-launch
-topology between calls and makes CUDA's graph-update step fail with
-`ERROR_GRAPH_EXEC_UPDATE_FAILURE`, while compiling (`cuModuleLoadDataEx`) mid-capture raises
-`ERROR_STREAM_CAPTURE_UNSUPPORTED`. The plain (non-capturing) call only reaches ordinary forces
-kernels, not the captured-path bias kernels -- hence two calls. Neither call's own force output is
-used; `forces_t`/`accels_t` are recomputed on the loop's first iteration regardless.
+Pre-materializes `BiasPotential` buffers and JIT-compiles captured-path kernels before the step
+loop's first capture, since CUDA graph capture allows neither mid-capture allocation nor
+compilation. Two calls: one plain, one capturing, since only the latter reaches the bias kernels.
+Output is discarded; forces are recomputed on the loop's first iteration regardless.
 """
 @inline function warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers,
                                             use_cuda_graph; n_threads)
@@ -1428,19 +1396,11 @@ end
     forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step, Val(use_cuda_graph),
                 has_bias_potential, finite_check_every; n_threads)
 
-Compute one step's forces, routing internally to the captured (`captured_forces_once!`) or plain
-(`forces!`) path so the step loop doesn't have to re-derive the routing condition itself. Only the
-steady-state case (`use_cuda_graph=true`, no virial needed, not a tile-refresh step) goes through
-the captured path; every other case -- including `use_cuda_graph=false` entirely -- falls back to a
-plain `forces!` call, same as before this wrapper existed. See `captured_forces_once!`'s docstring
-(`ext/MollyCUDAExt.jl`) for why the captured path is safe and cheap specifically here (topology
-fixed for the life of one `simulate!` call, tile refreshes invalidate the cache themselves).
-
-Also runs the deferred `BiasPotential` finiteness check (`check_bias_finite_periodic_batched!`)
-whenever it's due (every `finite_check_every` steps, and only when `use_cuda_graph` and at least
-one `BiasPotential` is attached -- captured steps defer this check instead of doing it inline like
-the normal, uncaptured force path does) -- see that function's docstring (`src/bias/bias.jl`) for
-why this needs to be batched and periodic rather than per-bias and per-step.
+One step's forces, routing to the captured or plain path so simulators don't repeat the routing
+logic themselves. Only steady-state steps (`use_cuda_graph=true`, no virial, no tile refresh) are
+captured; everything else falls back to plain `forces!`. Also runs the deferred `BiasPotential`
+finiteness check every `finite_check_every` steps (`check_bias_finite_periodic_batched!`,
+`src/bias/bias.jl`).
 """
 @inline function forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step,
                               ::Val{false}, has_bias_potential, finite_check_every; n_threads)
@@ -1460,9 +1420,6 @@ end
                n_threads=n_threads, defer_finite_check=true)
     end
     if run_bias_finite_check
-        # One host sync for every attached BiasPotential's bad_step at once, instead of n_bias
-        # separate from_device round trips (each pays a fixed tens-of-microseconds sync cost
-        # regardless of payload size) -- see check_bias_finite_periodic_batched!.
         check_bias_finite_periodic_batched!(values(sys.general_inters))
     end
     return nothing

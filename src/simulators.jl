@@ -43,15 +43,16 @@ function check_simulate_inputs(init_step::Integer, run_loggers, strictness)
     check_strictness(strictness)
 end
 
-# use_cuda_graph=true (VelocityVerlet's, DPDVelocityVerlet's, StormerVerlet's, NoseHoover's,
-# Langevin's and OverdampedLangevin's simulate! only, for now) wraps the steady-state (non-virial,
-# non-tile-refresh) forces! call of each step in a CUDA graph (CUDA.@captured), amortising
-# per-kernel host-dispatch overhead across the whole step instead of paying it per launch --
-# valuable when several BiasPotentials are attached (3-10 simultaneous CVs). This requires every
-# kernel launched inside the captured region to have zero host syncs and zero GPU allocation, so
-# it's illegal (and errors loudly here rather than silently falling back) unless ALL of the
-# following hold. See BiasPotential's cuda_graph_capturing branch (src/bias/bias.jl) and
-# ensure_unwrapped_coords! (src/force.jl) for what these translate to internally.
+"""
+    check_cuda_graph_legality(sys, use_cuda_graph)
+
+Validates a `use_cuda_graph=true` request (supported by `VelocityVerlet`, `DPDVelocityVerlet`,
+`StormerVerlet`, `NoseHoover`, `Langevin` and `OverdampedLangevin`'s `simulate!` for now), which
+wraps each step's steady-state `forces!` call in a CUDA graph to amortise per-kernel host-dispatch
+overhead -- worthwhile with several attached `BiasPotential`s. Every kernel inside the captured
+region must have zero host syncs and zero GPU allocation, so this errors loudly up front rather
+than failing silently or mid-capture when that doesn't hold.
+"""
 function check_cuda_graph_legality(sys, use_cuda_graph::Bool)
     use_cuda_graph || return nothing
     if !(sys.coords isa AbstractGPUArray)
@@ -68,19 +69,10 @@ function check_cuda_graph_legality(sys, use_cuda_graph::Bool)
             error("use_cuda_graph=true is not supported for CalcRMSD: its Kabsch alignment " *
                   "requires a host SVD every call, which cannot be captured.")
         end
-        # CalcMinDist/CalcMaxDist ARE supported: their persistent-scratch (MinMaxScratch) path
-        # (mindist_calculate_cv_fused!/mindist_gradient_fused!, cv.jl) finds the winning pair via a
-        # fully device-resident tile-reduce + bounded serial finalize, no findmin/findmax/host sync
-        # at all -- that's what BiasPotential's captured path (bias_cv_step!) always uses. The only
-        # host sync in the MinMaxScratch path is ExtremalPairCache's from_device readback, gated
-        # behind `extremal_cache !== nothing` and only actually populated by calculate_virial!'s
-        # (needs_vir) reuse -- bias_cv_step! passes extremal_cache=nothing, so it's never reached
-        # inside a captured region regardless (needs_vir steps are already excluded from capture
-        # entirely, same as any other CV type here).
         if inter.cv_type.correction == :pbc
             error("use_cuda_graph=true is not supported for a BiasPotential with " *
-                  "correction=:pbc: unwrap_molecules allocates GPU memory every call, which " *
-                  "cannot be captured. Use correction=:wrap instead.")
+                  "correction=:pbc: unwrap_molecules is GPU-native but still allocates every " *
+                  "call, which cannot be captured. Use correction=:wrap instead.")
         end
     end
     if length(sys.virtual_sites) > 0

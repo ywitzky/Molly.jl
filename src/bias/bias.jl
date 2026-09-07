@@ -241,16 +241,14 @@ spanning-forest traversal.
 mutable struct BiasPotential{C, B}
     cv_type::C
     bias_type::B
-    uses_persistent_buffers::Bool   # fixed at construction, see uses_builtin_cv_gradient!
-    grad::Any                       # lazily-allocated N_atoms-sized CV gradient buffer
-    d_buf::Any                      # lazily-allocated 1-element CV-value buffer
-    fs_svec::Any                    # lazily-allocated N_atoms-sized bias-force buffer
-    dist_scratch::Any               # CalcMinDist/CalcMaxDist only: fused-kernel O(group) scratch
-    extremal_cache::Any             # CalcMinDist/CalcMaxDist only: cached extremal pair for virial reuse
-    d_bias_buf::Any                 # lazily-allocated 1-element device buffer: bias_gradient's output,
-                                     # used only on the cuda_graph_capturing=true path (see forces! below)
-    bad_step::Any                   # lazily-allocated 1-element device Int buffer: first step_n at which
-                                     # a deferred finite check failed, or 0 -- see check_bias_finite_deferred!
+    uses_persistent_buffers::Bool   # set at construction, see uses_builtin_cv_gradient!
+    grad::Any                       # lazy CV gradient buffer
+    d_buf::Any                      # lazy CV-value buffer
+    fs_svec::Any                    # lazy bias-force buffer
+    dist_scratch::Any               # CalcMinDist/CalcMaxDist etc: fused-kernel scratch
+    extremal_cache::Any             # CalcMinDist/CalcMaxDist: cached extremal pair for virial reuse
+    d_bias_buf::Any                 # lazy bias_gradient output, cuda_graph_capturing path only
+    bad_step::Any                   # step of first deferred finite-check failure, or 0
 end
 
 function BiasPotential(cv_type::C, bias_type::B) where {C, B}
@@ -282,13 +280,19 @@ bias_max_abs_ustrip(value) = abs(ustrip(value))
     error(msg * ".")
 end
 
-# `buffers`/`step_n`, when supplied (from AtomsCalculators.forces!'s existing kwarg plumbing,
-# force.jl's general_inters loop), route through the shared, once-per-step unwrap cache
-# (ensure_unwrapped_coords!, src/force.jl) instead of recomputing unwrap_molecules independently
-# for every attached BiasPotential -- falls back to today's per-call behaviour otherwise.
+"""
+    bias_coords(sys, cv_type, buffers=nothing, step_n=nothing)
+
+Return the coordinates a `BiasPotential` should use, unwrapping across periodic
+boundaries when `cv_type.correction == :pbc`.
+
+When `buffers`/`step_n` are supplied, routes through the shared, once-per-step
+unwrap cache (`ensure_unwrapped_coords!`, `src/force.jl`) instead of recomputing
+`unwrap_molecules` independently for every attached `BiasPotential`.
+"""
 function bias_coords(sys, cv_type, buffers=nothing, step_n=nothing)
     cv_type.correction != :pbc && return sys.coords
-    if buffers !== nothing && step_n !== nothing && hasproperty(buffers, :unwrapped_coords)
+    if !isnothing(buffers) && !isnothing(step_n) && hasproperty(buffers, :unwrapped_coords)
         return ensure_unwrapped_coords!(buffers, sys, step_n)
     end
     return unwrap_molecules(sys)
@@ -296,13 +300,13 @@ end
 
 bias_needs_unwrap(b::BiasPotential) = b.cv_type.correction == :pbc
 
-# Compile-time-stable partition of a heterogeneous `general_inters` tuple into its BiasPotential
-# entries and everything else, preserving each group's relative order. A runtime `filter` isn't
-# type-stable on a `Tuple` with mixed element types, so this recurses like `Base.map`/`Base.tail`
-# do instead. Used by force.jl's cuda_graph_capturing branch to batch every attached
-# BiasPotential's captured-path tail (see bias_batched_tail!) while leaving any other
-# general_inters type (e.g. a future non-bias GPU-capturable interaction) on its current,
-# unbatched, per-inter AtomsCalculators.forces! call, unchanged.
+"""
+    split_biases(general_inters::Tuple)
+
+Partition a heterogeneous `general_inters` tuple into its `BiasPotential` entries
+and everything else, preserving each group's relative order. Recurses rather than
+using `filter`, which isn't type-stable on a mixed-type `Tuple`.
+"""
 @inline split_biases(::Tuple{}) = (), ()
 @inline function split_biases(t::Tuple)
     rest_biases, rest_others = split_biases(Base.tail(t))
@@ -310,10 +314,8 @@ bias_needs_unwrap(b::BiasPotential) = b.cv_type.correction == :pbc
     return x isa BiasPotential ? ((x, rest_biases...), rest_others) : (rest_biases, (x, rest_others...))
 end
 
-# Lazily allocate BiasPotential's persistent CV-value/gradient scratch (bias.grad/bias.d_buf) the
-# first time it's needed. Only reached when bias.uses_persistent_buffers is true (a CV type with
-# a real cv_gradient!/calculate_cv! -- custom/AD-only CV types never take this path, see
-# uses_builtin_cv_gradient! in cv.jl).
+# Lazily allocates bias.grad/bias.d_buf. Only reached when bias.uses_persistent_buffers is true
+# (a CV type with a real cv_gradient!/calculate_cv! -- see uses_builtin_cv_gradient! in cv.jl).
 function ensure_bias_buffers!(bias::BiasPotential, coords)
     if bias.grad === nothing
         bias.grad, bias.d_buf = zero_cv_gradient_buffers(bias.cv_type, coords)
@@ -321,27 +323,35 @@ function ensure_bias_buffers!(bias::BiasPotential, coords)
     return nothing
 end
 
-# Uploads a host index Vector to a persistent device array once -- shared by every ensure_*_scratch!
-# below so none of them repeat `@view coords[cv.atom_inds_1]`'s per-call re-upload (see
-# MinMaxScratch's docstring, cv.jl, for how that was confirmed live).
+# Uploads a host index Vector to the device once, avoiding the per-call re-upload that
+# `@view coords[cv.atom_inds_1]` would otherwise do on every call (see MinMaxScratch's
+# docstring, cv.jl).
 function upload_idx(coords, inds::Vector{Int})
     idx_dev = similar(coords, Int, length(inds))
     copyto!(idx_dev, inds)
     return idx_dev
 end
 
-# Lazily allocate CalcMinDist/CalcMaxDist-specific scratch: `extremal_cache` (small, cheap on any
-# backend) lets calculate_virial! reuse cv_gradient!'s search result instead of recomputing it;
-# `dist_scratch` (a `MinMaxScratch`) is only allocated when `coords` is actually GPU-resident,
-# since the CPU path never uses it. `idx1_dev`/`idx2_dev` upload `cv.atom_inds_1`/`atom_inds_2` to
-# the device exactly once here -- see MinMaxScratch's docstring (cv.jl) for why that matters (it's
-# what lets the two-kernel calculate_cv!/cv_gradient! path avoid `@view coords[cv.atom_inds_1]`,
-# which re-uploads those same indices on every call otherwise).
-#
-# Also handles CalcCMDist (a `CMDistScratch`, see cv.jl), CalcRg (a `RgScratch`), and CalcRMSD (a
-# `RmsdScratch`) the same way: each CV type's own dispatch of calculate_cv!/cv_gradient! only takes
-# its fused-kernel fast path once its matching scratch struct has been populated here, falling back
-# to the generic broadcast path otherwise (CPU, or a caller that never supplied `scratch=`).
+function bias_dist_scratch_types(coords, atoms)
+    CT = eltype(coords)
+    MT = fieldtype(eltype(atoms), :mass)
+    WT = typeof(zero(CT) * zero(MT))
+    IT = typeof(sum_abs2(zero(CT)) * zero(MT))
+    return CT, MT, WT, IT
+end
+
+"""
+    ensure_bias_dist_scratch!(bias::BiasPotential, coords, atoms)
+
+Lazily allocate CV-type-specific fused-kernel scratch (`bias.dist_scratch`, and for
+CalcMinDist/CalcMaxDist also `bias.extremal_cache`) the first time it's needed.
+
+Only allocated when `coords` is GPU-resident (the CPU path never uses it). Each CV
+type's own `calculate_cv!`/`cv_gradient!` dispatch only takes its fused-kernel fast
+path once its matching scratch struct has been populated here, falling back to the
+generic broadcast path otherwise. See the matching `*Scratch` docstring in `cv.jl`
+for why each one exists.
+"""
 function ensure_bias_dist_scratch!(bias::BiasPotential, coords, atoms)
     cv = bias.cv_type
     if cv isa CalcDist{<:Union{CalcMinDist, CalcMaxDist}} && bias.extremal_cache === nothing
@@ -349,9 +359,8 @@ function ensure_bias_dist_scratch!(bias::BiasPotential, coords, atoms)
         if is_gpu_resident(coords)
             idx1_dev, idx2_dev = upload_idx(coords, cv.atom_inds_1), upload_idx(coords, cv.atom_inds_2)
             na, nb = length(cv.atom_inds_1), length(cv.atom_inds_2)
-            # T caps mindist_tile_kernel!'s worker count (and mindist_finalize_*_kernel!'s serial
-            # scan length) at MINDIST_TILE_CAP regardless of how large na*nb gets -- see
-            # MinMaxScratch's docstring (cv.jl) for why this replaced the old O(na)-sized buffers.
+            # T caps kernel worker count at MINDIST_TILE_CAP regardless of na*nb -- see
+            # MinMaxScratch's docstring (cv.jl).
             T = min(na * nb, MINDIST_TILE_CAP)
             bias.dist_scratch = MinMaxScratch(
                 idx1_dev,
@@ -366,71 +375,48 @@ function ensure_bias_dist_scratch!(bias::BiasPotential, coords, atoms)
             )
         end
     elseif cv isa CalcDist{CalcCMDist} && bias.dist_scratch === nothing && is_gpu_resident(coords)
-        # T1/T2 (capped at 1024) size the partial-reduction buffers cmdist_reduce_kernel! writes
-        # into -- see CMDistScratch's docstring (cv.jl) for why this is what fixes CMDist's
-        # scaling. Sample types (not values -- `only(Array(...[1:1]))` is a one-off, construction-
-        # time-only host sync) drive the buffer eltypes: a mass-weighted position has different
-        # units than either a bare position or a bare mass, so `similar(coords, ...)` alone can't
-        # produce them.
         na, nb = length(cv.atom_inds_1), length(cv.atom_inds_2)
         T1, T2 = min(na, 1024), min(nb, 1024)
-        coord_sample = only(Array(view(coords, 1:1)))
-        mass_sample = mass(only(Array(view(atoms, 1:1))))
-        wpos_sample = coord_sample * mass_sample
-        dir_sample = coord_sample / norm(coord_sample)
+        CT, MT, WT, _ = bias_dist_scratch_types(coords, atoms)
+        DT = typeof(zero(CT) / oneunit(eltype(CT))) # unit-stripped direction vector
         bias.dist_scratch = CMDistScratch(
             upload_idx(coords, cv.atom_inds_1), upload_idx(coords, cv.atom_inds_2),
-            similar(coords, typeof(mass_sample), T1), similar(coords, typeof(wpos_sample), T1),
-            similar(coords, typeof(mass_sample), T2), similar(coords, typeof(wpos_sample), T2),
-            similar(coords, typeof(dir_sample), 1),
-            similar(coords, typeof(mass_sample), 1), similar(coords, typeof(mass_sample), 1),
+            similar(coords, MT, T1), similar(coords, WT, T1),
+            similar(coords, MT, T2), similar(coords, WT, T2),
+            similar(coords, DT, 1),
+            similar(coords, MT, 1), similar(coords, MT, 1),
         )
     elseif cv isa CalcRg && bias.dist_scratch === nothing && is_gpu_resident(coords)
-        # T (capped at RG_TILE_CAP) sizes the partial-reduction buffers rg_com_reduce_kernel!/
-        # rg_isum_reduce_*_kernel! write into -- see RgScratch's docstring (cv.jl) for why this is
-        # what fixes Rg's scaling. Same construction-time-only sample-type probing as CMDistScratch
-        # above (a mass-weighted position and a mass-weighted squared-deviation each have their
-        # own units, so `similar(coords, ...)` alone can't produce them).
         inds = iszero(length(cv.atom_inds)) ? collect(1:length(coords)) : cv.atom_inds
         n = length(inds)
         T = min(n, RG_TILE_CAP)
-        coord_sample = only(Array(view(coords, 1:1)))
-        mass_sample = mass(only(Array(view(atoms, 1:1))))
-        wpos_sample = coord_sample * mass_sample
-        isum_sample = sum_abs2(coord_sample) * mass_sample
+        CT, MT, WT, IT = bias_dist_scratch_types(coords, atoms)
         bias.dist_scratch = RgScratch(
             upload_idx(coords, inds),
-            similar(coords, typeof(mass_sample), T), similar(coords, typeof(wpos_sample), T),
-            similar(coords, typeof(isum_sample), T),
-            similar(coords, typeof(coord_sample), 1), similar(coords, typeof(mass_sample), 1),
+            similar(coords, MT, T), similar(coords, WT, T),
+            similar(coords, IT, T),
+            similar(coords, CT, 1), similar(coords, MT, 1),
         )
     elseif cv isa CalcRMSD && bias.dist_scratch === nothing && is_gpu_resident(coords)
         inds = iszero(length(cv.atom_inds)) ? collect(1:length(coords)) : cv.atom_inds
         ref_inds = iszero(length(cv.ref_atom_inds)) ? collect(1:length(cv.ref_coords)) : cv.ref_atom_inds
         ref_coords_used = cv.ref_coords[ref_inds]
-        # cv.ref_coords never changes after construction, so its Kabsch-centered form (one host
-        # sync) is computed exactly once, here, instead of on every cv_gradient!/calculate_cv! call
-        # -- see RmsdScratch's docstring (cv.jl). T (capped at RMSD_TILE_CAP) sizes
-        # rmsd_isum_reduce_kernel!'s partial-sum buffer -- `sum_abs2` of a length-valued SVector
-        # gives a length^2-valued sample (`rot` in the actual reduction is unitless, so this
-        # matches the real per-atom summand's type without needing rot/trans_1/trans_2 in hand).
+        # cv.ref_coords never changes after construction, so its Kabsch-centered form is computed
+        # once here rather than on every cv_gradient!/calculate_cv! call (RmsdScratch docstring, cv.jl).
         n = length(inds)
         T = min(n, RMSD_TILE_CAP)
-        coord_sample = only(Array(view(coords, 1:1)))
+        _, _, _, IT = bias_dist_scratch_types(coords, atoms)
         bias.dist_scratch = RmsdScratch(upload_idx(coords, inds), similar(coords, length(inds)),
                                         ref_coords_used, kabsch_centered(ref_coords_used),
-                                        similar(coords, typeof(sum_abs2(coord_sample)), T))
+                                        similar(coords, IT, T))
     end
     return nothing
 end
 
 function ensure_bias_gradient_buffer!(bias::BiasPotential)
     if bias.d_bias_buf === nothing
-        # bias_gradient's output has units of energy/CV-unit (e.g. kJ/mol/nm for a distance CV),
-        # NOT bias.d_buf's own units (the CV's native units, e.g. nm) -- similar(bias.d_buf, 1)
-        # would allocate the wrong (mismatched) unit type. Derive the correct type by running
-        # bias_gradient once on a representative host value (cheap, one-off, not a real CV
-        # evaluation) instead of guessing/hardcoding a units formula per bias type.
+        # bias_gradient's output units differ from bias.d_buf's own, so derive the eltype from a
+        # sample call rather than `similar(bias.d_buf, 1)`.
         sample = bias_gradient(bias.bias_type, oneunit(eltype(bias.d_buf)))
         bias.d_bias_buf = similar(bias.d_buf, typeof(sample), 1)
     end
@@ -445,14 +431,10 @@ function ensure_bias_finite_buffer!(bias::BiasPotential)
     return nothing
 end
 
-# One grid-stride kernel, no output allocation: every thread that finds a non-finite element
-# writes step_n into bad_step[1] (only if it's still 0). Concurrent writers only ever write the
-# *same* step_n, so the race is harmless and needs no atomic. This replaces an earlier
-# `mapreduce(...; dims=1)` + broadcast version -- `mapreduce` with `dims` allocates a fresh output
-# array on every call, and doing that inside a captured CUDA graph region (3x per bias per step)
-# shifts the pool's allocation pattern between calls, degrading @captured's cuGraphExecUpdate to a
-# slow path that scales badly with n_bias (confirmed live: capture speedup collapsed from ~2.1-2.7x
-# to <1x as n_bias grew). This kernel allocates nothing after bad_step itself is created.
+# Concurrent writers only ever write the same step_n into bad_step[1], so no atomic is needed.
+# Allocation-free by design: an earlier `mapreduce` version allocated per call, which inside a
+# captured CUDA graph degraded @captured's cuGraphExecUpdate to a slow path scaling badly with
+# n_bias (confirmed live).
 @kernel inbounds=true function bias_finite_check_kernel!(bad_step, @Const(value), step_n::Int)
     idx = @index(Global, Linear)
     if idx <= length(value) && !bias_all_finite(value[idx]) && bad_step[1] == 0
@@ -460,14 +442,15 @@ end
     end
 end
 
-# Records a non-finite `value` (an N_atoms- or 1-element device array -- d_buf/grad/fs_svec all
-# qualify) without reading anything back to the host and without allocating (see
-# bias_finite_check_kernel! above): the *first* bad step wins and every check after that is a
-# no-op write of the same value -- no host branch, no sync, safe to call every step. Used in place
-# of `check_bias_finite` for array-valued checks when `defer_finite_check=true` (Langevin's
-# use_cuda_graph path, both its captured and periodic-fallback steps -- see AtomsCalculators.forces!
-# below); the actual error, if any, is only raised later by check_bias_finite_periodic's cheap
-# 1-element readback.
+"""
+    check_bias_finite_deferred!(value::AbstractArray, bias::BiasPotential, step_n::Integer)
+
+Device-resident, allocation-free stand-in for `check_bias_finite` on array-valued
+checks (`d_buf`/`grad`/`fs_svec`): records the first non-finite step into
+`bias.bad_step` with no host sync, so it is safe to call every step, including
+inside a captured CUDA graph. The actual error, if any, is only raised later by
+[`check_bias_finite_periodic`](@ref)'s cheap 1-element readback.
+"""
 function check_bias_finite_deferred!(value::AbstractArray, bias::BiasPotential, step_n::Integer)
     backend = get_backend(value)
     n = length(value)
@@ -478,24 +461,15 @@ end
 
 # --- Batched captured-path tail across every attached BiasPotential at once ------------------
 #
-# cv_gradient! stays per-bias (genuinely CV-type-specific: different CVs need different reduction
-# kernels -- see bias_cv_step! below). bias_gradient (LinearBias/SquareBias/FlatBottomSquareBias/
-# PeriodicFlatBottomBias dispatch) and the remaining tail (finite check + fs_svec = d_bias_buf .*
-# grad; fs -= fs_svec) are both generic per-element work with no per-bias *kernel* needed -- a
-# tuple-recursion-unrolled kernel dispatches each bias's own bias_type/array at compile time (see
-# the NTuple recursion helpers below), same trick either way -- so they batch into 3 kernel
-# launches total per step instead of 3*n_bias -- see force.jl's cuda_graph_capturing branch for
-# the call site.
+# cv_gradient! stays per-bias (different CVs need different reduction kernels -- see bias_cv_step!
+# below). Everything after it (bias_gradient dispatch, finite check, force apply) is generic
+# per-element work, so a tuple-recursion-unrolled kernel can dispatch each bias's own
+# bias_type/array at compile time and batch all biases into 3 kernel launches per step instead of
+# 3*n_bias -- see force.jl's cuda_graph_capturing branch for the call site.
 #
-# grad/fs_svec are `NTuple`s of every bias's own buffer: both come from `ustrip_vec.(zero(coords))`/
-# `similar(fs)`, so they share one concrete element type across every non-Torsion,
-# persistent-buffer CV, making their NTuples homogeneous. d_buf/d_bias_buf/bad_step differ in
-# Unitful eltype per bias (different CV/energy units) -- their NTuples are heterogeneous but still
-# compile-time-resolved, same as any ordinary Julia function taking a heterogeneous tuple.
-# Recursion (not a runtime `for i in eachindex(t)` over a heterogeneous tuple) is what keeps
-# indexing type-stable/GPU-codegen-safe here -- the standard Julia idiom (see e.g. Base.map's own
-# tuple recursion). Both helpers below assume at least one bias (only called when
-# length(biases) > 0), so the base case is the 1-tuple, not the empty tuple.
+# Recursion over the NTuples keeps indexing type-stable/
+# GPU-codegen-safe when the tuple element types differ per bias (d_buf/d_bias_buf/bad_step have a
+# different Unitful eltype per bias). The helpers below assume at least one bias, so the base case is the 1-tuple.
 @inline function _bias_apply_recurse(grads::Tuple{Any}, fs_svecs::Tuple{Any}, d_bias_bufs::Tuple{Any}, i)
     v = d_bias_bufs[1][1] * grads[1][i]
     fs_svecs[1][i] = v
@@ -528,62 +502,42 @@ end
     return _bias_check_recurse(Base.tail(values), Base.tail(bad_steps), i, step_n)
 end
 
-# One launch checks every attached bias's d_buf/grad/fs_svec at once (each shorter than
-# ndrange=max(n_atoms) simply reads out of its own bounds check, same guard
-# bias_finite_check_kernel! already uses per-array); each bias's own bad_step is written
-# independently -- see check_bias_finite_deferred! for why concurrent same-value writes need no
-# atomic.
+# One launch checks every attached bias's d_buf/grad/fs_svec at once; each shorter than
+# ndrange=max(n_atoms) simply reads out via its own bounds check (as bias_finite_check_kernel!
+# does per-array). Each bias's bad_step is written independently, needing no atomic (see
+# check_bias_finite_deferred!).
 @kernel inbounds=true function bias_batched_finite_kernel!(values::NTuple{N}, bad_steps::NTuple{N},
                                                              step_n::Int) where N
     i = @index(Global, Linear)
     _bias_check_recurse(values, bad_steps, i, step_n)
 end
 
-# Per-bias half of the captured-path tail: computes bias.grad/d_buf, the one genuinely
-# CV-type-specific step that can't batch across biases (different CVs need different reduction
-# kernels -- see cv.jl). bias_gradient_kernel! (bias-type-specific dispatch, e.g. Linear/Square/
-# FlatBottom/Periodic) used to run here too, one ndrange=1 launch per bias; it's now folded into
-# bias_batched_tail!'s batched-gradient kernel below (same recursion-over-heterogeneous-tuple
-# trick as the force-apply/finite-check batching -- a scalar function dispatching on a
-# compile-time-resolved tuple slot batches exactly like an array-valued one does). Does not touch
-# fs (beyond using it as a shape/eltype template for fs_svec, matching the original single-launch
-# path exactly); bias_batched_tail! does the batched, dispatch-free remainder for every bias at
-# once.
-#
-# `do_check`: whether to run the finite-check kernels at all -- gates all 3 (2 here, 1 more in
-# bias_batched_tail!) together. Needed by the two-graph capture-once design (see
-# captured_forces_once!, MollyCUDAExt.jl): the no-check graph must never launch a finite-check
-# kernel (so it stays free of a baked-in step_n it could never update once captured); the
-# with-check graph is captured once with `step_n` fixed to a sentinel (not the real step number --
-# it's only ever launched again by *replaying* the already-captured graph, so a value baked in at
-# capture time would go stale) and simulate!'s step loop reports "somewhere in the last
-# finite_check_every steps" rather than an exact step on failure, using its own host-side step
-# counter (see simulators.jl).
+"""
+    bias_cv_step!(bias::BiasPotential, sys, coords, fs, step_n, do_check::Bool=true)
+
+Per-bias half of the captured-path tail: computes `bias.grad`/`d_buf`, the one
+CV-type-specific step that can't batch across biases. Pair with
+[`bias_batched_tail!`](@ref), which does the batched remainder for every attached
+bias at once.
+
+`do_check` gates the finite-check kernels here and in `bias_batched_tail!` together,
+needed by the two-graph capture-once design (`captured_forces_once!`,
+MollyCUDAExt.jl): the no-check graph must carry no baked-in `step_n`, while the
+with-check graph is captured once with a sentinel `step_n` and only ever replayed.
+"""
 function bias_cv_step!(bias::BiasPotential, sys, coords, fs, step_n, do_check::Bool=true)
     ensure_bias_buffers!(bias, coords)
     ensure_bias_dist_scratch!(bias, coords, sys.atoms)
     ensure_bias_gradient_buffer!(bias)
-    # Always ensured (not gated on do_check): bias.bad_step must already exist by the time the
-    # with-check graph is captured, and ensure_bias_finite_buffer! is cheap/idempotent once
-    # allocated -- see simulate!'s warm-up call (src/simulators.jl) for the same reasoning applied
-    # to bias.grad/d_buf/d_bias_buf.
     ensure_bias_finite_buffer!(bias)
-    # extremal_cache=nothing (not bias.extremal_cache): the captured path never calls
-    # calculate_virial! (needs_vir is excluded from the captured region entirely -- see
-    # simulators.jl), so nothing here ever reads bias.extremal_cache back. Passing the real cache
-    # would trigger mindist_gradient_fused!'s from_device readback (see its docstring, cv.jl) on
-    # every captured step for CalcMinDist/CalcMaxDist -- a host sync inside a captured region,
-    # illegal and pointless since the result is discarded. The ordinary (non-captured) forces!
-    # path below still passes the real cache, since that path's own needs_vir branch is what
-    # consumes it.
+    # extremal_cache=nothing: the captured path never calls calculate_virial!, and passing the
+    # real cache would trigger an illegal host-sync readback for CalcMinDist/CalcMaxDist.
     cv_gradient!(bias.grad, bias.d_buf, bias.cv_type, coords, sys.atoms, sys.boundary, sys.velocities;
                 extremal_cache=nothing, scratch=bias.dist_scratch)
     if do_check
         check_bias_finite_deferred!(bias.d_buf, bias, step_n)
         check_bias_finite_deferred!(bias.grad, bias, step_n)
     end
-    # `similar(fs)` (not `bias.grad`) because fs_svec's eltype is d_bias_buf .* grad's
-    # (force-with-units), same as fs's own eltype -- grad itself is unitless.
     bias.fs_svec === nothing && (bias.fs_svec = similar(fs))
     return nothing
 end
@@ -597,21 +551,23 @@ end
     return _bias_gradient_recurse(Base.tail(d_bias_bufs), Base.tail(d_bufs), Base.tail(bias_types))
 end
 
-# Batches bias_gradient_kernel! (see bias_cv_step!'s docstring) across every bias -- bias_types is
-# a plain (non-CuArray) NTuple of bias_type values, passed through to the device as kernel
-# arguments like `boundary`/other bitstype-ish scalar args elsewhere in this codebase.
+# Batches bias_gradient across every bias in one launch; bias_types is a plain NTuple of
+# bias_type values passed through as kernel arguments (like other bitstype-ish scalar args).
 @kernel inbounds=true function bias_batched_gradient_kernel!(d_bias_bufs::NTuple{N}, @Const(d_bufs::NTuple{N}),
                                                                bias_types::NTuple{N}) where N
     idx = @index(Global, Linear)
     idx == 1 && _bias_gradient_recurse(d_bias_bufs, d_bufs, bias_types)
 end
 
-# Batched tail: after every bias in `biases` has already run bias_cv_step! this step (which
-# already ran check_bias_finite_deferred! on d_buf/grad individually -- see bias_cv_step! above),
-# computes every bias's bias_gradient (d_bias_buf), applies all their force contributions to `fs`,
-# and checks the one array the tail itself produces (fs_svec) -- 3 kernel launches total (instead
-# of 3*length(biases): 1 bias_gradient + 1 finite-check + 1 apply per bias) -- see the NTuple
-# recursion helpers above.
+"""
+    bias_batched_tail!(fs, biases::Tuple, step_n, do_check::Bool=true)
+
+Batched remainder of the captured-path tail, run once every step after every bias
+in `biases` has already run [`bias_cv_step!`](@ref): computes each bias's
+`bias_gradient` (`d_bias_buf`), applies all their force contributions to `fs`, and
+finite-checks the array the tail itself produces (`fs_svec`). 3 kernel launches
+total instead of 3 per bias.
+"""
 function bias_batched_tail!(fs, biases::Tuple, step_n, do_check::Bool=true)
     isempty(biases) && return nothing
     grads       = map(b -> b.grad,       biases)
@@ -632,9 +588,13 @@ function bias_batched_tail!(fs, biases::Tuple, step_n, do_check::Bool=true)
     return nothing
 end
 
-# Periodic, out-of-graph readback for a BiasPotential using deferred finite checks (see
-# check_bias_finite_deferred! above) -- call this every `finite_check_every` steps from simulate!'s
-# step loop. A no-op until check_bias_finite_deferred! has actually run at least once.
+"""
+    check_bias_finite_periodic(bias::BiasPotential)
+
+Out-of-graph readback of a deferred finite check (see
+[`check_bias_finite_deferred!`](@ref)); call every `finite_check_every` steps from
+`simulate!`'s step loop. A no-op until a deferred check has actually run.
+"""
 function check_bias_finite_periodic(bias::BiasPotential)
     bias.bad_step === nothing && return nothing
     bad_step = only(from_device(bias.bad_step))
@@ -645,15 +605,15 @@ function check_bias_finite_periodic(bias::BiasPotential)
     return nothing
 end
 
-# Same as check_bias_finite_periodic, but for every attached BiasPotential at once: one host sync
-# instead of n_bias separate ones. check_bias_finite_periodic itself is a `from_device` (CUDA
-# sync) round trip regardless of payload size (tens of microseconds of driver/sync overhead, not
-# the 8 bytes actually transferred), so calling it once per bias every `finite_check_every` steps
-# (simulate!'s step loop, src/simulators.jl) was paying that fixed cost n_bias times where once
-# suffices -- confirmed via profile_host_overhead.jl's per-step overhead accounting. `vcat` of the
-# (tiny, n_bias-length) bad_step buffers is one cheap device-side kernel launch, then a single
-# from_device does the one sync this whole function needs. Skips any bias whose bad_step hasn't
-# been allocated yet (not yet warmed up).
+"""
+    check_bias_finite_periodic_batched!(biases)
+
+Same as [`check_bias_finite_periodic`](@ref), but for every attached
+`BiasPotential` at once: one host sync total instead of one per bias, since a
+`from_device` round trip costs tens of microseconds of driver/sync overhead
+regardless of payload size (confirmed via profiling). Skips any bias whose
+`bad_step` hasn't been allocated yet.
+"""
 function check_bias_finite_periodic_batched!(biases)
     live = Tuple(b for b in biases if b isa BiasPotential && b.bad_step !== nothing)
     isempty(live) && return nothing
@@ -696,19 +656,11 @@ function AtomsCalculators.forces!(
 )
     coords = bias_coords(sys, bias.cv_type, buffers, step_n)
 
-    # cuda_graph_capturing=true: zero-host-sync path for use inside a captured CUDA graph (see
-    # simulators.jl's use_cuda_graph option). check_bias_finite itself host-syncs/branches --
-    # illegal during graph capture -- so finite checks here always go through
-    # check_bias_finite_deferred! (device-resident, no sync); check_bias_finite_periodic (above),
-    # called from simulate!'s step loop outside the captured region, does the actual (cheap,
-    # 1-element) readback and raises the error if anything was ever recorded.
+    # cuda_graph_capturing=true: zero-host-sync path for use inside a captured CUDA graph.
+    # check_bias_finite itself are done outside forces! for graph usage
     if cuda_graph_capturing
-        # needs_vir is excluded from the captured region entirely (see simulators.jl), so no
-        # calculate_virial! call here. Single-bias call: bias_cv_step! (per-bias, CV/bias-type-
-        # specific) then bias_batched_tail! on a 1-tuple -- same 2 kernel launches the batched
-        # multi-bias path (force.jl) uses, so a lone BiasPotential costs no more than it did before
-        # this was split out. See bias_batched_tail!/force.jl's cuda_graph_capturing branch for the
-        # actual n_bias>1 batching this enables.
+        # needs_vir is excluded from the captured region entirely, so no calculate_virial! call
+        # here. see force.jl's cuda_graph_capturing branch for the n_bias>1 batching this enables.
         bias_cv_step!(bias, sys, coords, fs, step_n)
         bias_batched_tail!(fs, (bias,), step_n)
         return fs
@@ -718,10 +670,7 @@ function AtomsCalculators.forces!(
     if bias.uses_persistent_buffers
         ensure_bias_buffers!(bias, coords)
         ensure_bias_dist_scratch!(bias, coords, sys.atoms)
-        # Also warm up d_bias_buf here (not just on the cuda_graph_capturing path above) so that
-        # if a later step DOES call the cuda_graph_capturing branch first-of-its-kind, it isn't
-        # the one allocating it -- see the cuda_graph_capturing branch's comment above and
-        # simulate!'s explicit warm-up call (src/simulators.jl) for the same reasoning.
+        # Warm up d_bias_buf too, so a later cuda_graph_capturing call isn't the one allocating it.
         is_gpu_resident(coords) && ensure_bias_gradient_buffer!(bias)
         cv_gradient!(bias.grad, bias.d_buf, bias.cv_type, coords, sys.atoms, sys.boundary, sys.velocities;
                     extremal_cache=bias.extremal_cache, scratch=bias.dist_scratch)
@@ -736,11 +685,6 @@ function AtomsCalculators.forces!(
         )
     end
     check_bias_finite(cv_sim, "collective variable", bias)
-    # d_coords (== bias.grad when persistent) is N_atoms-sized -- bias_all_finite's plain `all(...)`
-    # forces a host sync on every call, which dominates a biased Langevin step's cost (confirmed by
-    # profiling; see the plan this refers to). defer_finite_check routes it through
-    # check_bias_finite_deferred! instead (device-resident, no sync); Langevin's step loop passes
-    # defer_finite_check=true and reads the deferred result back cheaply via check_bias_finite_periodic.
     if defer_finite_check
         ensure_bias_finite_buffer!(bias)
         check_bias_finite_deferred!(d_coords, bias, step_n)

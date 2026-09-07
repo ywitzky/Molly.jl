@@ -624,10 +624,11 @@ function MolecularTopology(bond_is, bond_js, n_atoms::Integer; kwargs...)
     return MolecularTopology(atom_molecule_inds, molecule_atom_counts, bonded_atoms; kwargs...)
 end
 
-# Build a spanning forest (parent pointer per atom, self-loop at roots) of the bonded-atom
-# graph via a stack-based DFS, mirroring the traversal in `unwrap_molecules` (spatial.jl) but
-# recording structure (parent/depth) instead of positions. Any consistent spanning tree gives a
-# physically valid unwrap, so which one the DFS picks doesn't matter for correctness.
+# Spanning forest (parent pointer per atom, self-loop at roots) of the bonded-atom graph via a
+# stack-based DFS. Any consistent spanning tree gives a physically valid unwrap, so the DFS's
+# particular choice doesn't matter for correctness. Feeds `parent`/`n_rounds` for
+# `_gpu_unwrap_fractional`'s pointer-doubling (spatial.jl); the CPU `unwrap_molecules` uses its
+# own independent traversal instead.
 function molecule_spanning_forest(atom_molecule_inds, bonded_atoms)
     n_atoms = length(atom_molecule_inds)
     adj = [Int[] for _ in 1:n_atoms]

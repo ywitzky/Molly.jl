@@ -31,11 +31,7 @@ periodic boundary conditions.
 """
 distances(coords, boundary) = norm.(displacements(coords, boundary))
 
-# Host-resident, origin-centered form of one set of coordinates, plus its centroid: the shared
-# first step of the Kabsch alignment below. `from_device` (one host sync) is unavoidable here --
-# LAPACK's svd() needs host data regardless -- but computing the centroid from the *already-synced*
-# host array (a plain, free CPU `sum(...; dims=2)`, not a second device-side reduction) avoids
-# paying for a *second* sync just to get a value the from_device call already pulled over.
+# Host-resident, origin-centered coordinates plus centroid; shared first step of Kabsch alignment.
 function kabsch_centered(coords::AbstractArray{SVector{3, T}}) where T
     n_atoms = length(coords)
     raw = from_device(reshape(reinterpret(T, coords), 3, n_atoms))
@@ -50,13 +46,8 @@ end
 #   is chosen to minimise the deviation, the term involving the derivative of the rotation
 #   vanishes and holding the rotation constant gives the exact gradient
 #
-# Returns (rotation, trans_1, trans_2): the Kabsch rotation plus both centroids, so
-# kabsch_deviations (below) can reuse them instead of recomputing.
-#
-# `cached_1`, if supplied, is a precomputed `kabsch_centered(coords_1)` result -- skips
-# host-syncing `coords_1` a second time. Meant for CalcRMSD's reference structure (cv.jl,
-# RmsdScratch): unlike the system's own coordinates, `cv.ref_coords` never changes between calls,
-# so it's centered exactly once (in ensure_bias_dist_scratch!, bias.jl) instead of every step.
+# Returns (rotation, trans_1, trans_2) so kabsch_deviations can reuse the centroids. `cached_1`
+# lets a precomputed kabsch_centered(coords_1) be reused (e.g. CalcRMSD's fixed reference, cv.jl).
 function kabsch_rotation_nograd(coords_1::AbstractArray{SVector{3, T}},
                                 coords_2::AbstractArray{SVector{3, T}};
                                 cached_1=nothing) where T
@@ -77,9 +68,6 @@ end
 # Assumes the coordinates do not cross the bounding box, i.e. all
 #   coordinates in each set correspond to the same periodic image
 function kabsch_deviations(coords_1, coords_2; cached_1=nothing)
-    # Reuses kabsch_rotation_nograd's own trans_1/trans_2 instead of recomputing them via a second
-    # sum(coords_1)/sum(coords_2) (each its own host sync on GPU-resident input) -- they're the
-    # same centroids either way, computed once now.
     rot, trans_1, trans_2 = kabsch_rotation_nograd(coords_1, coords_2; cached_1=cached_1)
     return (rot,) .* (coords_1 .- (trans_1,)) .- (coords_2 .- (trans_2,))
 end
@@ -112,8 +100,6 @@ Assumes the coordinates do not cross the bounding box, i.e. all
 coordinates correspond to the same periodic image.
 """
 function radius_gyration(coords, atoms)
-    # sum(coords) / length(coords) rather than mean(coords): mean() triggers
-    # scalar indexing (via first()) when coords is a @view of a CuArray
     center = sum(coords) / length(coords)
     atom_masses = mass.(atoms)
     I = sum(sum_abs2.(coords .- (center,)) .* atom_masses)

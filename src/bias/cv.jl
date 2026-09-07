@@ -23,10 +23,6 @@ end
 
 function center_of_mass!(coords, atoms, com, mass_total_buf=nothing)
     masses = mass.(atoms)
-    # sum(masses; dims=1), not sum(masses): the former stays device-resident (a 1-element
-    # array); the latter forces a blocking device->host sync to return a host scalar. The
-    # optional mass_total_buf lets callers that also need the total mass (CalcCMDist, CalcRg)
-    # reuse this reduction instead of recomputing sum(mass.(atoms)) themselves.
     mtot = sum(masses; dims=1)
     com .= sum(masses .* coords; dims=1) ./ mtot
     mass_total_buf === nothing || (mass_total_buf .= mtot)
@@ -52,15 +48,12 @@ function pairwise_distance_matrix(coords_1, coords_2, calc_type, boundary)
     return norm.(pairwise_displacement_matrix(coords_1, coords_2, calc_type, boundary))
 end
 
-# Finds the pair (i, j) minimizing/maximizing the distance between two groups of atoms,
-# using `extremum_fn = findmin`/`findmax`. Returns the indices, the extremal distance,
-# and the coords_1[i] -> coords_2[j] displacement vector, all without scalar-indexing
-# into `coords_1`/`coords_2` (safe for CuArray input).
+# Finds the pair (i, j) minimizing/maximizing the distance between two groups of atoms, using
+# `extremum_fn = findmin`/`findmax`. Returns the indices, the extremal distance, and the
+# coords_1[i] -> coords_2[j] displacement vector, without scalar-indexing (safe for CuArray).
 #
 # CPU / generic fallback: materializes the full group_a x group_b displacement matrix. Fine on
-# CPU (no memory ceiling anywhere near typical group sizes, no kernel-launch-count concern); on
-# GPU this is replaced below by `extremal_pair_fused`, which avoids materializing the O(Na*Nb)
-# matrix entirely (see that function's docstring for why).
+# CPU; on GPU this is replaced by `extremal_pair_fused` below, which avoids the O(Na*Nb) matrix.
 function extremal_pair_dense(coords_1, coords_2, calc_type, extremum_fn, boundary)
     diffs = pairwise_displacement_matrix(coords_1, coords_2, calc_type, boundary)
     dist_matrix = norm.(diffs)
@@ -70,11 +63,7 @@ function extremal_pair_dense(coords_1, coords_2, calc_type, extremum_fn, boundar
     return i, j, d, r_ij
 end
 
-# `coords_1`/`coords_2` are typically `@view coords[cv.atom_inds_1]`-style fancy-index views
-# (indexed by a `Vector{Int}`, not a range) -- a `SubArray` wrapping a `CuArray` this way is *not*
-# itself an `AbstractGPUArray` (only range-indexed views are), so a plain `::AbstractGPUArray`
-# dispatch would silently miss the fused GPU path for exactly the call pattern `cv_gradient!`
-# actually uses. Unwrap recursively via `parent` instead of dispatching on the wrapper type.
+# A fancy-index @view of a CuArray isn't itself an AbstractGPUArray, so unwrap via `parent`.
 is_gpu_resident(x::AbstractGPUArray) = true
 is_gpu_resident(x::SubArray) = is_gpu_resident(parent(x))
 is_gpu_resident(x) = false
@@ -87,56 +76,45 @@ function extremal_pair(coords_1, coords_2, calc_type, extremum_fn, boundary)
     end
 end
 
-# GPU-native `extremal_pair`: avoids ever materializing the dense group_a x group_b displacement
-# matrix (`extremal_pair_dense`'s approach), which is O(group_a * group_b) memory -- large groups
-# (tens of thousands of atoms per side) OOM (e.g. 51200 x 51200 SVector{3,Float32} needs ~29GB).
-#
-# Two-pass approach: Pass 1 (one @kernel launch, one thread per row of coords_1, each thread
-# scanning all of coords_2) writes only O(group_a)-sized per-row winners; Pass 2 is a plain
-# findmin/findmax over that small array. Compute is still O(group_a * group_b) -- unavoidable, a
-# true cutoff-free global extremum requires checking every pair -- but memory drops to O(group_a).
-#
-# This is the fallback used for ad-hoc calls with no persistent `MinMaxScratch` (e.g. direct
-# `calculate_cv`/`cv_gradient` calls with no BiasPotential behind them). BiasPotential's usual path
-# -- a persistent `MinMaxScratch` supplied and `coords` GPU-resident -- instead uses
-# `mindist_reduce_kernel!`/`mindist_finalize_value_kernel!`/`mindist_finalize_grad_kernel!` below,
-# which get rid of `findmin`/`findmax`'s host sync (and the two `from_device` reads after it)
-# entirely via an atomic device-side reduction, while keeping the exact same row-level parallelism
-# as the two-pass approach above -- see the comment above those kernels for the full design.
-#
-# `idx1_dev`/`idx2_dev` are device copies of `cv.atom_inds_1`/`atom_inds_2`, uploaded exactly once
-# (lazily, in ensure_bias_dist_scratch!, bias.jl) and reused on every subsequent call. This matters
-# because `@view coords[cv.atom_inds_1]` -- used by the generic `calculate_cv!` fallback and by
-# `extremal_pair_fused` below -- re-uploads the host index Vector to a *fresh* GPU array on every
-# single call (confirmed live via `CUDA.@allocated`: 40 bytes for a 5-index group, i.e. exactly
-# `sizeof(Int) * 5`), a real per-call allocation independent of kernel-launch count, and one that's
-# illegal inside a captured CUDA graph region regardless. `winner_i`/`winner_j`/`r_ij` cache the
-# most recent call's winning pair (device-resident), letting `calculate_virial_dist!` recover it
-# for `ExtremalPairCache` without redoing the O(group_a * group_b) search.
-# Caps the number of parallel workers `mindist_tile_kernel!` uses (see its docstring below) --
-# also the finalize kernel's serial-scan length, so this is the one knob trading finalize cost
-# against tile parallelism. 4096 keeps a single-thread scan over that many candidates in the
-# few-microsecond range while still giving a tiny/lopsided group (e.g. na=5, nb=100000) roughly
-# 800x more concurrent workers than the old one-thread-per-row design ever could.
-const MINDIST_TILE_CAP = 4096
+# GPU-native `extremal_pair`: avoids materializing the dense group_a x group_b displacement matrix
+# (O(group_a * group_b) memory -- OOMs for large groups). Fallback used with no persistent
+# `MinMaxScratch` (e.g. ad-hoc `calculate_cv`/`cv_gradient` calls); BiasPotential's usual path uses
+# the tile/finalize kernels below instead, which avoid findmin/findmax's host sync via a
+# device-side reduction -- see the comment above those kernels for the full design.
 
+"""
+    MinMaxScratch
+
+Persistent GPU scratch for the fused CalcMinDist/CalcMaxDist `calculate_cv!`/`cv_gradient!` path
+(see `mindist_tile_kernel!` below). `idx1_dev`/`idx2_dev` are device copies of
+`cv.atom_inds_1`/`atom_inds_2`, uploaded once and reused, avoiding CPU-GPU transfere and allowing CuGraph. `winner_i`/`winner_j`/`r_ij` cache the most recent winning pair so
+`calculate_virial_dist!` can reuse it via `ExtremalPairCache` instead of recomputing the search.
+"""
 mutable struct MinMaxScratch{IV, DV, JV, RV, SV, R1V}
-    idx1_dev::IV    # device copy of cv.atom_inds_1 (uploaded once)
-    idx2_dev::IV    # device copy of cv.atom_inds_2 (uploaded once)
-    out_dist::DV    # O(T): tile kernel's per-worker winning distance (T = min(na*nb, MINDIST_TILE_CAP))
-    out_i::JV       # O(T): tile kernel's per-worker winning row (index into group A)
-    out_j::JV       # O(T): tile kernel's per-worker winning column (index into group B)
-    out_disp::RV    # O(T): tile kernel's per-worker winning displacement
-    winner_i::SV    # 1-element: finalize kernel's global winning row
-    winner_j::SV    # 1-element: finalize kernel's global winning column
-    r_ij::R1V       # 1-element: finalize kernel's global winning displacement
+    idx1_dev::IV
+    idx2_dev::IV
+    out_dist::DV
+    out_i::JV
+    out_j::JV
+    out_disp::RV
+    winner_i::SV
+    winner_j::SV
+    r_ij::R1V
 end
 
-# Caches the (i, j, d, r_ij) result of an `extremal_pair` call made inside `cv_gradient!` for
-# CalcMinDist/CalcMaxDist, so a subsequent `calculate_virial_dist!` call in the same timestep (on
-# the same, unchanged `coords`) can reuse it instead of recomputing the O(group_a * group_b)
-# extremal search a second time. Populated by BiasPotential (bias.jl), unused (kwarg default
-# `nothing`) by any other caller.
+# Caps mindist_tile_kernel!'s parallel workers (also the finalize kernel's serial-scan length,
+# trading finalize cost against tile parallelism). 4096 keeps that scan in the few-microsecond
+# range while still giving a small/lopsided group (e.g. na=5, nb=1e5) far more concurrency than
+# one-thread-per-row would.
+const MINDIST_TILE_CAP = 4096
+
+"""
+    ExtremalPairCache
+
+Caches the `(i, j, d, r_ij)` result of an `extremal_pair` call made inside `cv_gradient!`, so a
+`calculate_virial_dist!` call later in the same timestep can reuse it instead of recomputing the
+O(group_a * group_b) search. Populated by `BiasPotential` (bias.jl); otherwise unused.
+"""
 mutable struct ExtremalPairCache
     valid::Bool
     i::Int
@@ -187,46 +165,21 @@ end
 
 # --------------------------------------------------------------
 # Fused path for CalcMinDist/CalcMaxDist's calculate_cv!/cv_gradient!, used whenever a persistent
-# `MinMaxScratch` is supplied (BiasPotential's usual case) and `coords` is GPU-resident. Plain
-# KernelAbstractions kernels throughout -- no atomics, no host syncs.
+# `MinMaxScratch` is supplied and `coords` is GPU-resident. No atomics, no host syncs.
 #
-# Earlier version of this comment described a one-thread-per-row design: `ndrange = group_a`,
-# each thread serially scanning all of group_b for its row's winner. That parallelises over
-# group_a only -- fine when group_a is itself large, but the realistic case for a CV is a small,
-# fixed reference group (a handful of atoms) checked against a much bigger group_b, and in that
-# case group_a-many threads is nowhere near enough parallelism: e.g. na=5 gives only 5 concurrent
-# workers each doing an O(nb) serial scan, using a vanishing fraction of the device regardless of
-# how large nb grows. Fixed by tiling over the *flattened* na*nb pair space instead of just rows:
-#  1. `mindist_tile_kernel!` -- ndrange=T=min(na*nb, MINDIST_TILE_CAP) workers, each grid-striding
-#     over a disjoint slice of the full na*nb pairs (not just one row), keeping a running local
-#     winner. T is capped (not just na) so parallelism now scales with the *total* amount of work
-#     regardless of how lopsided group_a/group_b are, and writes only O(T)-bounded output
-#     (`out_dist`/`out_i`/`out_j`/`out_disp`), not O(na).
-#  2. `mindist_finalize_value_kernel!`/`mindist_finalize_grad_kernel!` -- ndrange=1, serial scan
-#     over the T (<=MINDIST_TILE_CAP) worker outputs, not over na -- bounded regardless of group
-#     size, unlike the old design's O(group_a) scan (that finalize kernel becoming the actual
-#     bottleneck, once group_a itself grew large, is what motivated this rework).
-#  3. `mindist_clear_grad_kernel!` -- ndrange=group_a+group_b, one thread per atom, clearing any
-#     stale nonzero `grad` entry from a previous call's different winning pair. Previously this
-#     was a serial loop folded into kernel B; same O(group) bottleneck class as (2), so it gets
-#     its own parallel kernel, launched before the (now O(1)-ish) finalize kernel writes the new
-#     winning pair's 2 nonzero entries.
-# `calculate_cv!` needs (1)+(2) (2 launches, same count as before); `cv_gradient!` needs all of
-# (1)-(3) (3 launches, one more than before -- the trade for (2) and (3) no longer scaling with
-# group size). Two more things this avoids, same as previously:
-#  * `extremal_pair_fused` (above) needs `findmin`/`findmax` (a host sync) plus two `from_device`
-#    slice reads afterward on top of its own kernel launch; the kernels below need none.
-#  * `@view coords[cv.atom_inds_1]` (used by `calculate_cv!`'s generic fallback, and by
-#    `extremal_pair_fused`'s callers) re-uploads the host index Vector to a fresh GPU array on
-#    *every* call (confirmed live via CUDA.@allocated). `MinMaxScratch.idx1_dev`/`idx2_dev` are
-#    uploaded once and reused, so these kernels index into the *full* `coords`/`grad` arrays
-#    directly and never touch `@view`.
-#
-# `mindist_tile_kernel!` grid-strides over the *flattened* na*nb pair space: worker `tid` (of T
-# total) visits pairs `tid`, `tid+T`, `tid+2T`, ... (converted back to (i, j) via div/mod on group
-# B's length), tracking a running local winner. T = min(na*nb, MINDIST_TILE_CAP) guarantees every
-# worker's first iteration (k=tid<=T<=na*nb) is in range, so there's no sentinel/uninitialized-
-# winner case to special-case for workers that would otherwise get 0 pairs.
+# A one-thread-per-row design (ndrange=group_a) starves when group_a is small (the realistic CV
+# case, e.g. na=5 vs a much larger group_b). Fixed by tiling over the *flattened* na*nb pair space:
+#  1. `mindist_tile_kernel!` -- T=min(na*nb, MINDIST_TILE_CAP) workers grid-stride over disjoint
+#     slices of all na*nb pairs, each keeping a running local winner (O(T) output, not O(na)).
+#  2. `mindist_finalize_value_kernel!`/`mindist_finalize_grad_kernel!` -- serial scan over the
+#     T (<=MINDIST_TILE_CAP) worker outputs, bounded regardless of group size.
+#  3. `mindist_clear_grad_kernel!` -- clears any stale nonzero `grad` entry from a previous call's
+#     different winning pair, in parallel; must run before the finalize kernel writes the new
+#     winning pair's 2 entries. `calculate_cv!` needs (1)+(2); `cv_gradient!` needs all three.
+# `MinMaxScratch.idx1_dev`/`idx2_dev` are GPU-resident copies of `cv.atom_inds_1/2`.
+
+# Worker `tid` (of T) visits pairs `tid`, `tid+T`, `tid+2T`, ... (recovered as (i, j) via div/mod
+# on group B's length); T = min(na*nb, MINDIST_TILE_CAP) guarantees every worker gets a pair.
 @kernel inbounds=true function mindist_tile_kernel!(out_dist, out_i, out_j, out_disp, @Const(coords),
                                                      @Const(idx1), @Const(idx2), boundary,
                                                      closest::Bool, ::Val{is_min}) where is_min
@@ -273,11 +226,9 @@ end
     end
 end
 
-# Clears every candidate atom's `grad` entry in parallel (one thread per atom, ndrange=na+nb) --
-# split out from the old finalize kernel's serial O(na+nb) clearing loop, same reasoning as the
-# tile-vs-row split above. Must run (and, being on the same backend queue, does run, by launch
-# order -- see mindist_gradient_fused! below) before mindist_finalize_grad_kernel! writes the new
-# winning pair's 2 nonzero entries, or it would wipe them out again.
+# Clears every candidate atom's `grad` entry in parallel. Must run (guaranteed by launch order on
+# the same backend queue -- see mindist_gradient_fused! below) before mindist_finalize_grad_kernel!
+# writes the new winning pair's 2 nonzero entries, or it would wipe them out again.
 @kernel inbounds=true function mindist_clear_grad_kernel!(grad, @Const(idx1), @Const(idx2))
     tid = @index(Global, Linear)
     na = length(idx1)
@@ -327,13 +278,9 @@ function mindist_calculate_cv_fused!(dist_val, scratch::MinMaxScratch, coords, b
     return nothing
 end
 
-# Launches the tile + clear + finalize kernels (zero host syncs) and, only if `extremal_cache` was
-# actually supplied (BiasPotential's forces! path always supplies one for CalcMinDist/CalcMaxDist;
-# ad-hoc calculate_cv/cv_gradient calls don't), does one small readback afterward to populate it
-# for calculate_virial_dist!'s reuse -- see MinMaxScratch's docstring above. This readback never
-# runs during CUDA graph capture: virial steps are excluded from the captured region entirely (see
-# simulators.jl's check_cuda_graph_legality/step loop), so it can't reappear there even though it's
-# a host sync.
+# Zero host syncs except one small readback when `extremal_cache` is supplied, to populate it for
+# calculate_virial_dist!'s reuse. That readback is safe even though virial steps run outside CUDA
+# graph capture entirely (simulators.jl), so it never needs to be graph-legal.
 function mindist_gradient_fused!(grad, d_buf, scratch::MinMaxScratch, coords, boundary, closest::Bool,
                                  is_min::Val, extremal_cache)
     backend = get_backend(coords)
@@ -393,11 +340,6 @@ function dist_between_groups(md::CalcMinDist, coords_1, coords_2, boundary, args
 end
 
 function dist_between_groups!(md::CalcMinDist, coords_1, coords_2, dist_val, boundary, args...; kwargs...)
-    # Routed through extremal_pair (not a plain minimum(pairwise_distance_matrix(...))) so this
-    # also benefits from the GPU-native fused kernel below -- i/j/r_ij are unused here, but
-    # discarding them costs nothing extra since the kernel already computes them regardless.
-    # (This is the ad-hoc/no-persistent-scratch path -- see calculate_cv!'s CalcMinDist/CalcMaxDist
-    # override below for the single-kernel path used when a BiasPotential's MinMaxScratch exists.)
     _, _, d, _ = extremal_pair(coords_1, coords_2, md.calc_type, findmin, boundary)
     dist_val .= d
     return nothing
@@ -482,32 +424,10 @@ function dist_between_groups!(cd::CalcCMDist, coords_1, coords_2, dist_val, boun
     return nothing
 end
 
-# --------------------------------------------------------------
-# Fused path for CalcCMDist's calculate_cv!/cv_gradient!, used whenever a persistent
-# `CMDistScratch` is supplied (BiasPotential's usual case) and `coords` is GPU-resident.
-#
-# Originally this was a *single* ndrange=1 thread doing both group sums (and, for cv_gradient!,
-# the per-atom gradient write) serially, on the theory that O(group_a + group_b) is cheap enough
-# to not need row-parallelism. That's wrong at real GPU-relevant group sizes: a single lane doing
-# a strictly serial loop gets none of the device's parallelism, so wall time grows linearly with
-# group size with ~1/1000th of the GPU active -- confirmed by measurement to scale horribly
-# compared to the (embarrassingly parallel) CPU loop it's supposed to beat. Fixed by splitting
-# into 3 kernels, each doing the maximum useful amount of parallel work at every stage:
-#   1. `cmdist_reduce_kernel!` -- ndrange=max(T1,T2) threads (T1/T2 = min(group size, 1024)), each
-#      doing a grid-stride partial reduction of its group's mass/mass-weighted-position into a
-#      small (<=1024-element) `partial_mass*`/`partial_wpos*` buffer. This is the real fix: turns
-#      an O(group) *serial* scan into an O(group/T) *parallel* one.
-#   2. `cmdist_finalize_kernel!` -- ndrange=1, but now only sums the small (<=1024-element)
-#      partial-reduction buffers, not the raw group (bounded cost regardless of group size).
-#      Writes `dist_val`, plus `dir_buf`/`mtot1_buf`/`mtot2_buf` (small persistent device
-#      buffers, only read by step 3, so `cv_gradient!` never needs a host sync to get them there).
-#   3. `cmdist_grad_write_kernel!` -- ndrange=group_a+group_b, one thread per atom, writing that
-#      atom's gradient entry in parallel instead of serially (the write is O(group), same
-#      class of bottleneck as the reduction, so it gets the same treatment).
-# `calculate_cv!` only needs steps 1-2 (2 launches); `cv_gradient!` needs all 3. `idx1_dev`/
-# `idx2_dev` (persistent device copies of cv.atom_inds_1/2, uploaded once in
-# ensure_bias_dist_scratch!, bias.jl) exist for the same reason as MinMaxScratch's: `@view
-# coords[cv.atom_inds_1]` re-uploads the host index Vector on every call otherwise.
+# Fused CalcCMDist path: reduce (parallel partial mass/weighted-position sums), finalize (sum
+# the small partials), grad-write (per-atom, parallel). A serial ndrange=1 thread would leave
+# the device idle and scaled linearly with group size. calculate_cv! needs reduce+finalize;
+# cv_gradient! needs all three.
 mutable struct CMDistScratch{IV, MV, WV, DV, SV}
     idx1_dev::IV
     idx2_dev::IV
@@ -520,9 +440,7 @@ mutable struct CMDistScratch{IV, MV, WV, DV, SV}
     mtot2_buf::SV
 end
 
-# Kept for CalcRg (below) and the CPU/no-scratch fallback path -- a single serial O(group) sum,
-# fine there since Rg's group is typically not the pathological case this file's CMDist rework
-# above was fixed for, and the CPU path is already an ordinary (parallel-over-cores) loop.
+# Kept for CalcRg and the CPU/no-scratch fallback -- fine as a serial O(group) sum there.
 @inline function cmdist_com(coords, atoms, idx)
     n = length(idx)
     m1 = mass(atoms[idx[1]])
@@ -590,10 +508,8 @@ end
         r12 = closest ? vector(com1, com2, boundary) : com2 - com1
         d = norm(r12)
         dist_val[1] = d
-        # Unconditional division (no `d > 0` branch): kernel C (cmdist_grad_write_kernel! below)
-        # only ever reads dir_buf inside its own `d > 0` branch, so a NaN/Inf here when d==0 is
-        # never observed -- and keeping this branchless avoids a same-vs-different-units ternary
-        # (r12/d is dimensionless, zero(r12) is not).
+        # Unconditional division: cmdist_grad_write_kernel! only reads dir_buf inside its own
+        # `d > 0` branch, so a NaN/Inf here when d==0 is never observed.
         dir_buf[1] = r12 / d
         mtot1_buf[1] = mtot1
         mtot2_buf[1] = mtot2
@@ -658,8 +574,6 @@ function dist_between_groups!(sd::CalcSingleDist, coords_1, coords_2, dist_val, 
         throw(ArgumentError("CalcSingleDist can only be used with atom groups containing one atom"))
     end
     c1, c2 = only(from_device(coords_1)), only(from_device(coords_2))
-    #c1 = coords_1
-    #c2 = coords_2
     if sd.calc_type == :closest
         dist_val .= norm(vector(c1, c2, boundary))
     else
@@ -731,12 +645,8 @@ function calculate_cv!(cv::CalcDist, coords, atoms, boundary, buff, args...; kwa
     return nothing
 end
 
-# Fused reduce+finalize path, used whenever a persistent `MinMaxScratch` is supplied
-# (BiasPotential's usual case) and `coords` is GPU-resident -- see mindist_reduce_kernel!'s
-# docstring above for why this bypasses the generic method above entirely rather than just calling
-# dist_between_groups! (that generic method's `@view coords[cv.atom_inds_1]` lines are exactly the
-# per-call allocation this path exists to avoid). Falls back to the generic method otherwise (CPU,
-# or no scratch).
+# Fused path used whenever a persistent `MinMaxScratch` is supplied and `coords` is GPU-resident
+# (see MinMaxScratch's docstring); falls back to the generic method otherwise (CPU, or no scratch).
 function calculate_cv!(cv::CalcDist{<:Union{CalcMinDist, CalcMaxDist}}, coords, atoms, boundary, buff,
                        args...; scratch=nothing, kwargs...)
     if scratch !== nothing && is_gpu_resident(coords)
@@ -753,9 +663,8 @@ function calculate_cv!(cv::CalcDist{<:Union{CalcMinDist, CalcMaxDist}}, coords, 
     return nothing
 end
 
-# Single-kernel fused path, used whenever a persistent `CMDistScratch` is supplied (BiasPotential's
-# usual case) and `coords` is GPU-resident -- see CMDistScratch's docstring above. Falls back to
-# the generic method otherwise (CPU, or no scratch).
+# Fused path used whenever a persistent `CMDistScratch` is supplied and `coords` is GPU-resident;
+# falls back to the generic method otherwise (CPU, or no scratch).
 function calculate_cv!(cv::CalcDist{CalcCMDist}, coords, atoms, boundary, buff, args...;
                        scratch=nothing, kwargs...)
     if scratch !== nothing && is_gpu_resident(coords)
@@ -779,11 +688,7 @@ function calculate_cv!(cv::CalcDist{CalcCMDist}, coords, atoms, boundary, buff, 
     return nothing
 end
 
-# CalcSingleDist always involves exactly 2 known-index atoms: a single-thread GPU kernel doing
-# the whole computation avoids the ~6-8 separate broadcast kernel launches (each with a fixed
-# ~15-20us dispatch floor, regardless of data size) that the generic broadcast-based path above
-# costs on a CuArray. Indices are plain host Ints (from cv.atom_inds_1/2, never device data), so
-# this needs no from_device/to_device sync at all -- genuinely a single kernel launch.
+# Single-thread kernel avoiding the generic broadcast path's multiple kernel-launch overhead.
 @kernel inbounds=true function single_dist_cv_kernel!(d_buf, @Const(coords), i, j, boundary,
                                                        closest::Bool)
     idx = @index(Global, Linear)
@@ -885,8 +790,7 @@ function cv_gradient!(grad, d_buf, cv::CalcDist{CalcSingleDist}, coords, atoms, 
     return nothing
 end
 
-# GPU fast path: one kernel launch (see single_dist_cv_gradient_kernel! above) instead of the
-# ~6-8 broadcast kernel launches of the generic method above.
+# GPU fast path: one kernel launch
 function cv_gradient!(grad::AbstractGPUArray, d_buf::AbstractGPUArray,
                       cv::CalcDist{CalcSingleDist}, coords::AbstractGPUArray, atoms, boundary,
                       args...; kwargs...)
@@ -932,11 +836,7 @@ function cv_gradient!(grad, d_buf, cv::CalcDist{CalcMinDist}, coords, atoms, bou
         extremal_cache.d, extremal_cache.r_ij = d, r_ij
     end
 
-    # Clear the full static candidate set (atom_inds_1 ∪ atom_inds_2) that ANY call to this
-    # function could have written to on a PREVIOUS call with this same (possibly persistent,
-    # reused across steps) `grad` buffer -- the winning pair can move between calls. O(group
-    # size), not O(N_atoms). Harmless-redundant when `grad` was freshly zeroed (the
-    # non-persistent-buffer path).
+    # necessary to clear the whole candidate set to remove previous results
     zg = zero(eltype(grad))
     grad[cv.atom_inds_1] .= (zg,)
     grad[cv.atom_inds_2] .= (zg,)
@@ -1099,10 +999,8 @@ function calculate_virial_dist!(virial_buff, dt::CalcSingleDist, cv, coords, for
     virial_buff .+= r_ji * transpose(f_i)
 end
 
-# `precomputed_extremum`, if supplied (an `ExtremalPairCache` with `valid == true`, populated by
-# a `cv_gradient!` call made moments earlier in the same timestep on the same `coords`), skips
-# recomputing the O(group_a * group_b) extremal search a second time -- see ExtremalPairCache's
-# docstring above.
+# `precomputed_extremum`, if a valid `ExtremalPairCache` from this timestep's `cv_gradient!` call,
+# skips recomputing the O(group_a * group_b) extremal search.
 function calculate_virial_dist!(virial_buff, dt::CalcMinDist, cv, coords, forces, atoms, boundary;
                                 precomputed_extremum=nothing, kwargs...)
     if precomputed_extremum !== nothing && precomputed_extremum.valid
@@ -1189,32 +1087,11 @@ function calculate_cv(cv::CalcRg, coords, atoms, args...; kwargs...)
 end
 
 # Fused path for CalcRg's calculate_cv!/cv_gradient!, used whenever a persistent `RgScratch` is
-# supplied (BiasPotential's usual case) and `coords` is GPU-resident.
-#
-# Originally (like CMDist before its own rework, above) a single ndrange=1 thread doing the whole
-# O(group) sum plus gradient write -- fine for a handful of atoms, but the same serial bottleneck
-# once `group` is large. Unlike CMDist, Rg has a genuine 2-stage data dependency: the sum of
-# squared deviations from the center of mass (`Isum`) needs the *already-finalized* center of
-# mass as an input, so its reduction can't start until the COM reduction has fully finished --
-# there's no way to collapse this into a single parallel pass the way CMDist's one independent
-# sum could be. So this needs 2 reduce+finalize pairs back to back, not 1:
-#   1. `rg_com_reduce_kernel!` -- ndrange=T=min(n, RG_TILE_CAP), grid-stride partial mass/
-#      mass-weighted-position reduction (same shape as cmdist_reduce_kernel!'s per-group body).
-#   2. `rg_com_finalize_kernel!` -- ndrange=1, serial sum over the T (bounded) partials, writes
-#      `com_buf`/`mtot_buf` (device-resident, no host sync -- read directly by stage 3 below).
-#   3. `rg_isum_reduce_kernel!` -- ndrange=T, grid-stride partial reduction of
-#      `sum_abs2(r_k - com) * m_k` now that `com`/`mtot` are known, into `partial_isum`.
-#   4. `rg_finalize_value_kernel!`/`rg_finalize_grad_kernel!` -- ndrange=1, serial sum over the T
-#      `partial_isum` entries, writes the CV value (and, for the gradient path, `d_buf`).
-#   5. (gradient only) `rg_grad_write_kernel!` -- ndrange=n, one thread per atom, writing that
-#      atom's gradient entry in parallel (same reasoning as CMDist's grad-write kernel).
-# `calculate_cv!` needs stages 1-4 (4 launches); `cv_gradient!` needs all 5. More launches than
-# CMDist's fix (2/3) -- an inherent cost of the extra sequential dependency, not slack left on the
-# table -- but every stage is now genuinely parallel (or an O(T)-bounded scan) regardless of group
-# size, instead of one O(group) serial thread. `idx_dev` (persistent device copy of the atom
-# indices used, uploaded once in ensure_bias_dist_scratch!, bias.jl -- covering the "atom_inds=[]
-# means all atoms" case too, via a materialized `1:n_atoms`) avoids `@view coords[cv.atom_inds]`'s
-# per-call re-upload.
+# supplied and `coords` is GPU-resident. Rg has a genuine 2-stage dependency: the sum of squared
+# deviations from the center of mass needs the already-finalized COM as an input. Hence 2
+# reduce+finalize pairs back to back -- COM reduce/finalize, then an Isum reduce/finalize using
+# the now-known COM -- plus a final grad-write kernel (gradient path only) that writes each
+# atom's entry in parallel. `calculate_cv!` needs the first 4 stages; `cv_gradient!` needs all 5.
 const RG_TILE_CAP = 1024
 
 mutable struct RgScratch{IV, MV, WV, IsV, CV, MtV}
@@ -1256,12 +1133,9 @@ end
     end
 end
 
-# Two separate kernels, not one with a boundary/use_pbc flag: `calculate_cv!` (below) has no
-# `boundary` available to pass at all (matches the original `rg_value_kernel!`'s signature and
-# `radius_gyration`'s CPU definition, neither of which apply a PBC correction here), while
-# `cv_gradient!` does and uses `vector(com, coords[k], boundary)` (matching the original
-# `rg_gradient_kernel!`). That value/gradient asymmetry predates this rework and is preserved
-# as-is, not "fixed", to avoid any change in observable behaviour.
+# Two separate kernels, not one with a boundary/use_pbc flag: calculate_cv! has no `boundary` to
+# pass (matches radius_gyration's CPU definition, no PBC correction), while cv_gradient! does.
+# This value/gradient asymmetry predates this rework and is preserved as-is.
 @kernel inbounds=true function rg_isum_reduce_value_kernel!(pisum, @Const(coords), @Const(atoms),
                                                              @Const(idx), @Const(com_buf))
     tid = @index(Global, Linear)
@@ -1400,13 +1274,7 @@ function cv_gradient!(grad, d_buf, cv::CalcRg, coords, atoms, boundary, args...;
     rg = sqrt.(rg_sq)
     d_buf .= rg
 
-    # Device-resident masked write (mirrors CalcDist{CalcSingleDist}'s ifelse-masking above)
-    # instead of a host `if rg > zero(rg)` branch -- `rg` is now a 1-element device array, so a
-    # host branch on it would force a sync. This also fixes a stale-buffer hazard for free (same
-    # cost either way, since it's one fused broadcast regardless of the mask outcome): with a
-    # *reused* grad buffer, the old host-branch version left a previous call's stale gradient at
-    # `atom_inds_used` on a degenerate (rg == 0) step, since the unconditional-false branch never
-    # wrote anything; this version always writes, zero on the degenerate branch.
+    # use mask to avoid host-sync
     mask = rg .> zero(eltype(rg))
     rg_safe = ifelse.(mask, rg, oneunit.(rg))
     inv_factor = 1 ./ (M_total .* rg_safe)
@@ -1493,40 +1361,17 @@ function calculate_cv(cv::CalcRMSD, coords, args...; kwargs...)
     return only(from_device(buff))
 end
 
-# Persistent scratch for CalcRMSD's calculate_cv!/cv_gradient!, used whenever supplied
-# (BiasPotential's usual case) and `coords` is GPU-resident. Unlike the other CV types above, the
-# Kabsch alignment inside `rmsd`/`kabsch_deviations` (analysis.jl) always needs a host LAPACK SVD
-# -- fundamentally, permanently host-sync-bound, no GPU alternative -- so this doesn't chase that
-# cost down to zero. What it does remove:
-#  1. `rmsd_coords`'s `coords[atom_inds_used]` re-*allocates* a gathered copy *and* re-uploads
-#     `atom_inds_used` on every call (same `@view`/fancy-index cost as everywhere else in this
-#     file). `idx_dev`/`coords_used` replace it with a persistent index array plus a single
-#     `gather_kernel!` launch into a reused buffer.
-#  2. `cv.ref_coords[ref_atom_inds_used]` redundantly re-slices data that can never change after
-#     construction -- computed once, here, as `ref_coords_used`.
-#  3. `kabsch_rotation_nograd` (analysis.jl) syncs *both* coordinate sets to host every call, but
-#     the reference side is exactly as constant as (2) -- `ref_kabsch` precomputes
-#     `kabsch_centered(ref_coords_used)` once, here, so every subsequent call's `cached_1=` kwarg
-#     skips host-syncing the reference a second (and third, and...) time.
-#  4. Everything *after* the SVD -- `kabsch_deviations`'s broadcast, `mean(sum_abs2, diffs)` (a
-#     second host sync in its own right: `mean` with no `dims=` on a device array), and the
-#     `grad[atom_inds_used] = ...` scatter write -- used to be 3 separate device broadcast kernels
-#     plus that second host sync. `rmsd_isum_reduce_kernel!` + `rmsd_finalize_*_kernel!` +
-#     (gradient only) `rmsd_grad_write_kernel!` below do all of it device-side once `rot`/
-#     `trans_1`/`trans_2` (host scalars, from the SVD step) are known, so the *only* unavoidable
-#     sync left is the SVD's own `from_device` on the current (non-reference) coordinates.
-#
-#     Originally this was one more single ndrange=1 thread doing the whole O(group) sum (and, for
-#     cv_gradient!, the gradient write) serially -- same disease as CMDist/Rg had, fixed the same
-#     way: `rmsd_isum_reduce_kernel!` grid-strides over T=min(group, RMSD_TILE_CAP) workers into
-#     `partial_isum`; `rmsd_finalize_value_kernel!`/`rmsd_finalize_grad_kernel!` serially sum only
-#     those T (bounded) partials; `rmsd_grad_write_kernel!` (gradient only) writes each atom's
-#     gradient entry in parallel (ndrange=group) instead of serially. No separate "reduce the
-#     alignment target" stage is needed here the way Rg needed one for its center of mass --
-#     `rot`/`trans_1`/`trans_2` are already fully known (from the host-side SVD) before any of
-#     these kernels run, so this is a 1-stage reduction, not Rg's 2-stage one.
 const RMSD_TILE_CAP = 1024
 
+"""
+    RmsdScratch
+
+Persistent GPU scratch for the fused CalcRMSD `calculate_cv!`/`cv_gradient!` path.
+`idx_dev`/`coords_used` avoid re-gathering/re-uploading the used atom indices every call;
+`ref_coords_used`/`ref_kabsch` precompute the reference side once (it never changes after
+construction); a reduce/finalize/grad-write kernel trio computes the RMSD value and gradient
+device-side once the Kabsch rotation is known.
+"""
 mutable struct RmsdScratch{IV, CV, RCV, KV, PV}
     idx_dev::IV
     coords_used::CV
@@ -1752,10 +1597,8 @@ function calculate_cv!(cv::CalcTorsion, coords, atoms, boundary, buff, args...; 
     return nothing
 end
 
-# CalcTorsion always involves exactly 4 known-index atoms, same as CalcSingleDist's 2 -- a
-# single-thread GPU kernel avoids the from_device host sync the generic method above pays on
-# every call (not just multiple launches: `coords[cv.atom_inds]` there is a full device->host
-# sync, since `pts` is then used as plain host StaticArrays values).
+# Single-thread GPU kernel avoids the from_device host sync the generic method above pays on
+# every call (`coords[cv.atom_inds]` there is a full device->host sync).
 @kernel inbounds=true function torsion_cv_kernel!(d_buf, @Const(coords), i, j, k, l, boundary)
     idx = @index(Global, Linear)
     if idx == 1
@@ -1851,16 +1694,9 @@ function cv_gradient!(grad, d_buf, cv::CalcTorsion, coords, atoms, boundary, arg
     return nothing
 end
 
-# GPU fast path: one kernel launch instead of the from_device host sync + host StaticArrays math
-# the generic method above pays on every call. Mirrors single_dist_cv_gradient_kernel! above.
-#
-# check_torsion_bond_norm's CPU throw (ArgumentError on degenerate bond-length geometry) has no
-# GPU equivalent -- kernels can't throw catchable exceptions. Rather than silently floor and
-# succeed (which would produce a plausible-but-wrong gradient, diverging from the CPU path's
-# fail-loud behaviour), the degenerate case writes NaN into the affected atoms' gradient instead.
-# check_bias_finite (src/bias/bias.jl) already errors on a non-finite CV gradient every step in
-# the normal (non-graph-capture) path, so this still fails loud -- via the existing finite-check
-# mechanism instead of a `throw`.
+# check_torsion_bond_norm's CPU throw has no GPU equivalent (kernels can't throw catchable
+# exceptions), so the degenerate case writes NaN into the affected atoms' gradient instead --
+# still fails loud, via check_bias_finite's existing non-finite-gradient check (bias.jl).
 @kernel inbounds=true function torsion_cv_gradient_kernel!(grad, d_buf, @Const(coords),
                                                             i, j, k, l, boundary, tol)
     idx = @index(Global, Linear)
@@ -1934,39 +1770,34 @@ end
 
 # --------------------------------------------------------------
 # Persistent-buffer support for BiasPotential (src/bias/bias.jl).
-#
-# Not every CV type has a buffer-writing calculate_cv!/cv_gradient! -- a custom, user-defined CV
-# type that only implements calculate_cv falls back to the generic Enzyme-AD cv_gradient
-# (ext/MollyEnzymeExt.jl), which has no buffer-writing equivalent. This trait, computed once at
-# BiasPotential construction (no coords needed), gates BiasPotential's persistent-buffer path to
-# exactly the CV types below; everything else keeps using the allocating calculate_cv/cv_gradient
-# wrappers unchanged.
+
+# Trait gating BiasPotential's persistent-buffer path to CV types with a buffer-writing
+# calculate_cv!/cv_gradient!; a custom CV that only implements calculate_cv falls back to the
+# generic Enzyme-AD cv_gradient (ext/MollyEnzymeExt.jl), which has no buffer-writing equivalent.
 uses_builtin_cv_gradient!(::CalcDist) = true
 uses_builtin_cv_gradient!(::CalcRg) = true
 uses_builtin_cv_gradient!(::CalcRMSD) = true
 uses_builtin_cv_gradient!(::CalcTorsion) = true
 uses_builtin_cv_gradient!(::Any) = false
 
-# Buffer-shape helpers, deduplicating the grad/d_buf allocation pattern repeated across every
-# allocating cv_gradient/calculate_cv wrapper above. Used both by those wrappers and by
-# BiasPotential's lazy persistent-buffer initialization (bias.jl).
+# Buffer-shape helpers, deduplicating the grad/d_buf allocation pattern used by every allocating
+# cv_gradient/calculate_cv wrapper above and by BiasPotential's lazy buffer init (bias.jl).
 zero_cv_grad_buffer(cv, coords)  = ustrip_vec.(zero(coords))
 zero_cv_value_buffer(cv, coords) = similar(coords, eltype(eltype(coords)), 1)
-# CalcTorsion's CV value/gradient are unitless (an angle), unlike the other CV types
-# (length-valued).
+# CalcTorsion's CV value/gradient are unitless (an angle), unlike the other (length-valued) types.
 zero_cv_grad_buffer(cv::CalcTorsion, coords) =
     ustrip_vec.(zero(coords)) / oneunit(eltype(eltype(coords)))
 zero_cv_value_buffer(cv::CalcTorsion, coords) =
     similar(coords, typeof(float(ustrip(oneunit(eltype(eltype(coords)))))), 1)
 zero_cv_gradient_buffers(cv, coords) = (zero_cv_grad_buffer(cv, coords), zero_cv_value_buffer(cv, coords))
 
-# `calculate_cv!`'s positional-argument prefix before `buff` varies by CV type (CalcRg omits
-# `boundary`; CalcRMSD omits both `atoms` and `boundary`) -- `buff` is a *required named*
-# parameter for all of them, unlike `cv_gradient!`/`calculate_cv`, where any extra positional
-# args are absorbed harmlessly by a trailing `args...`, so a uniform `(cv, coords, atoms,
-# boundary, buff, args...)` call would silently misassign `buff`'s slot for CalcRg/CalcRMSD.
-# This gives callers that need to invoke `calculate_cv!` generically (BiasPotential; also used
-# the same way in Julia_Benchmark/Profile_CVs.jl) one uniform calling convention.
+"""
+    calculate_cv_buffered!(cv, coords, atoms, boundary, buff, args...; kwargs...)
+
+Uniform-signature wrapper around `calculate_cv!`, whose positional-argument prefix before `buff`
+varies by CV type (`CalcRg` omits `boundary`; `CalcRMSD` omits `atoms`/`boundary`). Lets callers
+that invoke `calculate_cv!` generically across CV types use one fixed call signature.
+"""
 calculate_cv_buffered!(cv::CalcRMSD, coords, atoms, boundary, buff, args...; kwargs...) =
     calculate_cv!(cv, coords, buff; kwargs...)
 calculate_cv_buffered!(cv::CalcRg, coords, atoms, boundary, buff, args...; kwargs...) =

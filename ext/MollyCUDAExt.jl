@@ -899,53 +899,30 @@ function Molly.invalidate_cuda_graph_cache!(buffers::Molly.BuffersGPU)
     return nothing
 end
 
-# CUDA graph capture: records the kernel-launch sequence of one steady-state forces! call once,
-# then replays it (CUDA.@captured) instead of re-dispatching every kernel from the host each step.
-# Only reached when simulate!'s use_cuda_graph=true and check_cuda_graph_legality
-# (src/simulators.jl) has already verified every precondition holds (GPU-resident System, no
-# CalcRMSD/custom-CV/:pbc-correction BiasPotential, no virtual sites/constraints), and the caller
-# has already excluded virial/tile-refresh steps (is_tile_refresh_step above).
-#
-# Kept as-is (not the entry point Langevin's simulate! actually uses any more -- see
-# captured_forces_once! below) because @captured's automatic re-capture-on-topology-change is a
-# useful safety net for any *other* caller of captured_forces! that doesn't have simulate!'s own
-# topology-change handling (needs_vir/is_tile_refresh_step fallback).
+"""
+    captured_forces!(fs, sys::System{<:Any, <:CuArray}, args...; kwargs...)
+
+CUDA-graph-captured `forces!` via `CUDA.@captured`, which re-captures on topology change. Not the
+entry point `simulate!` uses (see `captured_forces_once!` below, which capture-once/replays
+instead) -- kept as a safety net for callers without `simulate!`'s own topology-change handling.
+"""
 function Molly.captured_forces!(fs, sys::System{D, <:CuArray, T}, args...; kwargs...) where {D, T}
     @captured Molly.forces!(fs, sys, args...; kwargs...)
     return nothing
 end
 
-# Captures forces!'s steady-state kernel-launch sequence once per topology (first call after
-# `buffers.graph_exec_no_check`/`graph_exec_with_check` is nothing), then just CUDA.launch()s the
-# cached CuGraphExec on every later call with matching topology -- no per-call re-capture, no
-# cuGraphExecUpdate. Confirmed via an isolated micro-benchmark that a bare replay is ~3x cheaper
-# than @captured's per-call record+update and ~2x cheaper than not capturing at all.
-# simulate!'s step loop routes needs_vir/is_tile_refresh_step steps around the captured path
-# entirely (see simulators.jl); a tile refresh additionally invalidates the cache
-# (invalidate_cuda_graph_cache!, called from pairwise_forces_loop_gpu! above) since it changes
-# buffers.num_pairs -- and with it the pairwise kernel's launch grid -- forcing a recapture on the
-# next eligible step rather than replaying a graph sized for the old tile list.
-#
-# Caller contract: never call this on a step is_tile_refresh_step(sys, buffers, step_n) would
-# return true for (as simulate!'s loop already ensures). A refresh needs a host sync
-# (refresh_interacting_tiles!'s from_device), which is illegal mid-CUDA.capture() -- calling this
-# on a refresh step lets that sync happen INSIDE the capture attempt here and crashes.
-#
-# `do_check` (kwarg, defaults true) selects which of the two graphs (cached separately in
-# buffers.graph_exec_no_check/graph_exec_with_check) to use -- see bias_cv_step!/bias_batched_tail!
-# (src/bias/bias.jl) for why the finite-check kernels can't be in the same graph as the
-# steady-state-only path: they take step_n as a plain kernel argument, which would be frozen at
-# whatever value was current on the ONE call that captured the graph. The with-check graph is
-# therefore always captured using a fixed sentinel step_n (not the real one) -- simulate!'s step
-# loop already only reports "somewhere since the last finite check" on failure, not an exact step,
-# to match (see simulators.jl).
-#
-# Called exactly like captured_forces!: captured_forces_once!(fs, sys, neighbors, step_n, buffers,
-# Val(needs_vir); kwargs..., do_check=...) -- (fs, sys, args...) here matches Molly.forces!'s own
-# positional order (fs, sys, neighbors, step_n, buffers, Val(needs_vir)), so args[2]/args[3] (after
-# the fs, sys pulled off separately) are step_n/buffers.
 const BIAS_FINITE_CHECK_SENTINEL_STEP = 1
 
+"""
+    captured_forces_once!(fs, sys::System{<:Any, <:CuArray}, neighbors, step_n, buffers,
+                          Val(needs_vir); kwargs..., do_check=true)
+
+Captures `forces!`'s kernel-launch sequence once, then replays the cached `CuGraphExec` on every
+later call. Never call on a tile-refresh step (`is_tile_refresh_step`) -- its host sync is illegal
+mid-capture; a refresh instead invalidates the cache, forcing recapture next eligible step.
+`do_check` picks one of two separately-cached graphs, since the finite-check kernels' `step_n`
+argument would otherwise freeze at capture time.
+"""
 function Molly.captured_forces_once!(fs, sys::System{D, <:CuArray, T}, args...;
                                       do_check::Bool=true, kwargs...) where {D, T}
     buffers = args[3]
@@ -1032,9 +1009,8 @@ Cache contract:
 - `buffers.step_n_preprocessed` gates reuse of reordered coordinates and tile
   search work within a simulation step.
 - `buffers.num_pairs` is the host-side cached interacting-tile count used to
-  size the force-kernel launch. A tile refresh changes it, so any cached
-  use_cuda_graph `CuGraphExec` (its launch grid frozen at capture time) is
-  invalidated ([`invalidate_cuda_graph_cache!`](@ref)) whenever one occurs here.
+  size the force-kernel launch. A tile refresh changes it, invalidating any
+  cached `use_cuda_graph` `CuGraphExec` ([`invalidate_cuda_graph_cache!`](@ref)).
 - `sys.neighbor_finder.initialized` only indicates whether the sparse exception
   masks are current. The interacting-tile list still depends on
   `n_steps_reorder` and `dist_cutoff`.
@@ -1067,9 +1043,6 @@ function Molly.pairwise_forces_loop_gpu!(buffers, sys::System{D, <:CuArray, T, T
 
         if needs_tile_refresh
             refresh_interacting_tiles!(buffers, sys, N)
-            # buffers.num_pairs (read below to size the pairwise kernel's launch grid) just
-            # changed -- any cached use_cuda_graph CuGraphExec has that grid size frozen in from
-            # before this refresh and must not be replayed against the new tile list.
             Molly.invalidate_cuda_graph_cache!(buffers)
         end
         buffers.step_n_preprocessed = step_n
@@ -2042,11 +2015,8 @@ function force_kernel!(
     # Part 1 inner loop indexes this shared data by slot instead of rotating it
     # around the warp with serial shuffles. Host must pass a matching `shmem`.
     # @inbounds elides CuDynamicSharedArray's size check: the host allocates a
-    # matching `shmem`, and sh_vel is never DEREFERENCED when no interaction uses
-    # velocity -- but CuDynamicSharedArray's constructor itself still validates its
-    # requested extent against the block's shared memory allocation, so sh_vel must
-    # be built with a zero column count in that case (host reserves 0 bytes for it,
-    # force_kernel_dynamic_shmem above), not just left unindexed.
+    # matching `shmem`, and sh_vel (unallocated when no interaction uses velocity)
+    # is never dereferenced in that case
     # Only the Atom fields the active interactions actually read are staged (not the
     # full Atom), matching what the old warp-shuffle path sent per lane.
     shuf_syms = resolved_atom_shuffle_syms(inters_tuple, A)
@@ -2551,11 +2521,8 @@ function energy_kernel!(
     # when an interaction uses them, velocities), mirroring force_kernel!'s Part 1.
     # Only the Atom fields the active interactions read are staged (`shuf_syms`/`P`).
     # Energy needs no opposites_sum accumulator. @inbounds elides the size check;
-    # the host passes a matching `shmem`, and sh_vel is never DEREFERENCED when no
-    # interaction uses velocity -- but CuDynamicSharedArray's constructor itself still
-    # validates its requested extent against the block's shared memory allocation, so
-    # sh_vel must be built with a zero column count in that case (host reserves 0
-    # bytes for it, energy_kernel_dynamic_shmem above), not just left unindexed.
+    # the host passes a matching `shmem`, and sh_vel (unallocated when no
+    # interaction uses velocity) is never dereferenced in that case.
     shuf_syms = resolved_atom_shuffle_syms(inters_tuple, A)
     P = atom_payload_type(A, shuf_syms)
     by = Int(blockDim().y)

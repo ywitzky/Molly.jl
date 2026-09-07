@@ -705,16 +705,17 @@ function unwrap_molecules(coords::AbstractVector{<:SVector{D}}, boundary, topolo
     return out
 end
 
-# GPU-native molecule unwrapping. `unwrap_molecules`'s CPU implementation above walks the bond
-# graph with a stack-based DFS, accumulating each atom's unwrapped position from its
-# already-unwrapped neighbour (u[j] = u[i] + minimum_image(f[j] - f[i])) — an inherently
-# sequential, tree-shaped dependency. This computes the same result without any host round trip
-# or per-atom scalar indexing, using a precomputed spanning-forest `parent` pointer
-# (`topology.parent`, built once at System construction) and parallel pointer-doubling: each
-# round, every atom's (parent, accumulated delta) is replaced with its parent's, halving the
-# remaining path length to the root every round, so `topology.n_rounds` (~log2 of the deepest
-# molecule's bond-graph depth) rounds suffice regardless of molecule size. The final per-molecule
-# center-of-geometry re-centering is a segmented mean via sort + inclusive scan (no atomics).
+"""
+    _gpu_unwrap_fractional(coords, boundary, topology)
+
+GPU-native molecule unwrapping. The CPU `unwrap_molecules` walks the bond graph with a stack-based
+DFS -- an inherently sequential dependency. This gets the same result with no host round trip via
+parallel pointer-doubling on a precomputed spanning-forest `parent` pointer (`topology.parent`):
+each round replaces every atom's (parent, accumulated delta) with its parent's, halving the
+remaining path length to the root, so `topology.n_rounds` (~log2 of the deepest molecule's depth)
+rounds suffice regardless of molecule size. Per-molecule center-of-geometry is a segmented mean via
+sort + inclusive scan (no atomics).
+"""
 function _gpu_unwrap_fractional(coords::AbstractGPUArray{<:SVector{D}}, boundary, topology) where D
     AT = array_type(coords)
     to_frac, to_cart, wrap01 = _frac_cart_closures(boundary, Val(D))
