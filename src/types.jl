@@ -425,38 +425,6 @@ function Base.show(io::IO, sil::T) where T <: SpecificInteractionList
     print(io, nameof(T), " with ", length(sil.is), " interactions of type ", eltype(sil.inters))
 end
 
-function inject_interaction_list(inter::InteractionList1Atoms, params_dic, AT)
-    inters_grad = to_device(inject_interaction.(from_device(inter.inters),
-                                inter.types, (params_dic,)), AT)
-    InteractionList1Atoms(inter.is, inters_grad, inter.types, inter.data)
-end
-
-function inject_interaction_list(inter::InteractionList2Atoms, params_dic, AT)
-    inters_grad = to_device(inject_interaction.(from_device(inter.inters),
-                                inter.types, (params_dic,)), AT)
-    InteractionList2Atoms(inter.is, inter.js, inters_grad, inter.types, inter.data)
-end
-
-function inject_interaction_list(inter::InteractionList3Atoms, params_dic, AT)
-    inters_grad = to_device(inject_interaction.(from_device(inter.inters),
-                                inter.types, (params_dic,)), AT)
-    InteractionList3Atoms(inter.is, inter.js, inter.ks, inters_grad, inter.types, inter.data)
-end
-
-function inject_interaction_list(inter::InteractionList4Atoms, params_dic, AT)
-    inters_grad = to_device(inject_interaction.(from_device(inter.inters),
-                                inter.types, (params_dic,)), AT)
-    InteractionList4Atoms(inter.is, inter.js, inter.ks, inter.ls, inters_grad, inter.types,
-                          inter.data)
-end
-
-function inject_interaction_list(inter::InteractionList5Atoms, params_dic, AT)
-    inters_grad = to_device(inject_interaction.(from_device(inter.inters),
-                                inter.types, (params_dic,)), AT)
-    InteractionList5Atoms(inter.is, inter.js, inter.ks, inter.ls, inter.ms, inters_grad,
-                          inter.types, inter.data)
-end
-
 """
     Atom(; <keyword arguments>)
 
@@ -503,31 +471,27 @@ function Atom(; index=Int32(1), atom_type=Int32(1), mass=1.0u"g/mol", charge=0.0
     return Atom(index, atom_type, mass, charge, σ, ϵ, λ, alch_role)
 end
 
-function Base.zero(::Atom{T, M, C, S, E, L}) where {T, M, C, S, E, L}
+function Base.zero(::Type{Atom{T, M, C, S, E, L}}) where {T, M, C, S, E, L}
     return Atom(Int32(0), zero(T), zero(M), zero(C), zero(S), zero(E), zero(L), CoreRole)
 end
+
+Base.zero(at::Atom) = zero(typeof(at))
 
 function Base.:+(a1::Atom, a2::Atom)
     return Atom(a1.index, a1.atom_type, a1.mass + a2.mass, a1.charge + a2.charge,
                 a1.σ + a2.σ, a1.ϵ + a2.ϵ, a1.λ + a2.λ, a1.alch_role)
 end
 
-# get function errors with AD
-dict_get(dic, key, default::T) where {T} = (haskey(dic, key) ? T(dic[key]) : default)
-
-function inject_atom(at, at_data, params_dic)
-    key_prefix = "atom_$(at_data.atom_type)_"
-    Atom(
-        at.index,
-        at.atom_type,
-        dict_get(params_dic, key_prefix * "mass"  , at.mass),
-        at.charge, # Residue-specific
-        dict_get(params_dic, key_prefix * "σ"     , at.σ   ),
-        dict_get(params_dic, key_prefix * "ϵ"     , at.ϵ   ),
-        at.λ, # Preserve lambda from existing atom,
-        at.alch_role
-    )
+# The `get` function errors with AD, so branch on `haskey` instead. For a `Dict` go
+# straight to the slot: `haskey` followed by `getindex` hashes the key twice, and this is
+# on the hot path of every gradient through `inject_gradients`. Reverse mode never sees
+# this body, as `MollyEnzymeExt` puts a rule on `dict_get`.
+function dict_get(dic::Dict, key, default::T) where T
+    idx = Base.ht_keyindex(dic, key)
+    return (idx > 0 ? T(@inbounds dic.vals[idx]) : default)
 end
+
+dict_get(dic, key, default::T) where {T} = (haskey(dic, key) ? T(dic[key]) : default)
 
 """
     charge(atom)
@@ -739,12 +703,27 @@ n_atoms_to_n_pairs(n_atoms::Integer) = (n_atoms * (n_atoms - 1)) ÷ 2
 
 Base.length(nl::NoNeighborList) = n_atoms_to_n_pairs(nl.n_atoms)
 
-function pair_index(n_atoms::Integer, ind::Integer)
-    kz = ind - 1
-    iz = n_atoms - 2 - Int(floor(sqrt(-8 * kz + 4 * n_atoms * (n_atoms - 1) - 7) / 2 - 0.5))
-    jz = kz + iz + 1 - (n_atoms * (n_atoms - 1)) ÷ 2 + ((n_atoms - iz) * ((n_atoms - iz) - 1)) ÷ 2
-    i = iz + 1
-    j = jz + 1
+# Zero-based index of the first pair whose zero-based first atom is iz
+@inline pair_row_start(n_atoms::Integer, iz::Integer) = iz * (n_atoms - 1) - (iz * (iz - 1)) ÷ 2
+
+# Map a one-based index over the n_atoms * (n_atoms - 1) ÷ 2 pairs to the pair (i, j), i < j
+# The square root is taken in Float32 since Metal GPUs do not support Float64, so the initial
+#   estimate of i can be off by one or more for large n_atoms and is corrected below using
+#   exact integer arithmetic, which also makes the result the same on all backends
+@inline function pair_index(n_atoms::Integer, ind::Integer)
+    n, kz = promote(n_atoms, ind - one(ind))
+    T = typeof(n)
+    disc = 4 * n * (n - 1) - 7 - 8 * kz
+    iz = min(max(n - 2 - unsafe_trunc(T, sqrt(Float32(disc)) / 2.0f0 - 0.5f0), zero(T)), n - 2)
+    while iz > 0 && pair_row_start(n, iz) > kz
+        iz -= one(T)
+    end
+    while iz < n - 2 && pair_row_start(n, iz + one(T)) <= kz
+        iz += one(T)
+    end
+    jz = kz - pair_row_start(n, iz) + iz + one(T)
+    i = iz + one(T)
+    j = jz + one(T)
     return i, j
 end
 
@@ -818,8 +797,142 @@ end
 
 function check_float_types(T, TH)
     if promote_type(T, TH) != TH
-        throw(ArgumentError("Float type is $T and float_type_high is $TH, which appears " *
+        throw(ArgumentError("float_type is $T and float_type_high is $TH, which appears " *
                             "to be a lower precision type"))
+    end
+end
+
+# The default value of float_type_high, which is Float64 unless the backend does not
+#   support Float64 (Metal), in which case the general float type is used
+function default_float_type_high(backend::Backend, ::Type{T}) where T
+    return (KernelAbstractions.supports_float64(backend) ? Float64 : T)
+end
+
+default_float_type_high(::AbstractArray, ::Type{T}) where {T} = Float64
+
+function default_float_type_high(arr::AbstractGPUArray, ::Type{T}) where T
+    return default_float_type_high(get_backend(arr), T)
+end
+
+default_float_type_high(::Type{<:AbstractArray}, ::Type{T}) where {T} = Float64
+
+function default_float_type_high(::Type{AT}, ::Type{T}) where {AT <: AbstractGPUArray, T}
+    # get_backend requires an array rather than an array type, Float32 is used to make
+    #   the array since it is supported by every backend
+    return default_float_type_high(get_backend(AT{Float32}(undef, 0)), T)
+end
+
+function check_n_dims(coords::AbstractVector{SVector{DC, C}},
+                      vels::AbstractVector{SVector{DV, V}},
+                      D) where {DC, C, DV, V}
+    if DC != D
+        throw(ArgumentError("the boundary has $D dimensions but the coordinates have " *
+                            "$DC, they should match"))
+    end
+    if DV != D
+        throw(ArgumentError("the boundary has $D dimensions but the velocities have " *
+                            "$DV, they should match"))
+    end
+end
+
+function check_float_type_consistency(T, coords, vels, boundary, strictness)
+    mismatches = String[]
+    for (FT, name) in ((typeof(one(eltype(eltype(coords)))), "coords"    ),
+                       (typeof(one(eltype(eltype(vels))))  , "velocities"),
+                       (float_type(boundary)               , "boundary"  ))
+        if FT != T
+            push!(mismatches, "$name ($FT)")
+        end
+    end
+    if length(mismatches) > 0
+        err_str = "float_type of the System is $T but a different float type is used by " *
+                  join(mismatches, ", ") * ". float_type is read from the boundary by " *
+                  "default and can be set with the float_type argument, mixing float " *
+                  "types loses precision and can fail to compile on GPU."
+        report_issue(err_str, strictness)
+    end
+end
+
+function check_neighbor_finder(neighbor_finder, pairwise_inters, n_atoms, boundary,
+                               on_gpu, strictness)
+    neighbor_finder isa NoNeighborFinder && return nothing
+
+    for name in (:eligible, :special)
+        hasproperty(neighbor_finder, name) || continue
+        mask = getproperty(neighbor_finder, name)
+        mask isa AbstractMatrix || continue
+        if size(mask) != (n_atoms, n_atoms)
+            throw(ArgumentError("the $name matrix in the neighbor finder has size " *
+                                "$(size(mask)) but the system has $n_atoms atoms, it " *
+                                "should be $((n_atoms, n_atoms))"))
+        end
+        if on_gpu && !isa(mask, AbstractGPUArray)
+            throw(ArgumentError("the atoms are on the GPU but the $name matrix of the " *
+                                "neighbor finder is not, try $name=to_device($name, AT) " *
+                                "where AT is the GPU array type"))
+        end
+        if !on_gpu && isa(mask, AbstractGPUArray)
+            throw(ArgumentError("the atoms are not on the GPU but the $name matrix " *
+                                "of the neighbor finder is"))
+        end
+    end
+
+    if hasproperty(neighbor_finder, :dist_cutoff)
+        nf_cutoff = neighbor_finder.dist_cutoff
+        max_sqdist = max_zero_beyond(pairwise_inters)
+        if !isnothing(max_sqdist) && dimension(max_sqdist) == dimension(nf_cutoff^2) &&
+                            max_sqdist > nf_cutoff^2
+            err_str = "the neighbor finder has a cutoff of $nf_cutoff but a pairwise " *
+                      "interaction has a larger cutoff of $(sqrt(max_sqdist)), interacting " *
+                      "pairs will be missed"
+            report_issue(err_str, strictness)
+        end
+    end
+end
+
+function check_cutoff_box_size(dist_cutoff, boundary, strictness)
+    has_infinite_boundary(boundary) && return nothing
+    isinf(ustrip(dist_cutoff)) && return nothing
+    min_box_side = minimum(box_sides(boundary))
+    if dimension(min_box_side) != dimension(dist_cutoff)
+        return nothing # Unit mismatches are reported elsewhere
+    end
+    if min_box_side < (2 * dist_cutoff)
+        err_str = "Minimum box side ($min_box_side) is less than 2 * dist_cutoff " *
+                  "($(2 * dist_cutoff)), this can lead to unphysical simulations " *
+                  "since multiple copies of the same atom are seen but only one is " *
+                  "considered due to the minimum image convention"
+        report_issue(err_str, strictness)
+    end
+end
+
+function check_specific_inter_lists(specific_inter_lists, n_atoms, on_gpu)
+    device_fields = (:is, :js, :ks, :ls, :ms, :inters, :data) # `types` stays on the CPU
+    for (li, inter_list) in enumerate(values(specific_inter_lists))
+        for name in device_fields
+            hasproperty(inter_list, name) || continue
+            arr = getproperty(inter_list, name)
+            arr isa AbstractArray || continue
+            if on_gpu && !isa(arr, AbstractGPUArray)
+                throw(ArgumentError("the atoms are on the GPU but the $name field of " *
+                                    "specific interaction list $li is not, try " *
+                                    "Molly.to_device on the fields of the interaction list"))
+            end
+            if !on_gpu && isa(arr, AbstractGPUArray)
+                throw(ArgumentError("the atoms are not on the GPU but the $name field " *
+                                    "of specific interaction list $li is"))
+            end
+        end
+        # Atom indices are read on the CPU where possible to avoid scalar indexing
+        for name in (:is, :js, :ks, :ls, :ms)
+            hasproperty(inter_list, name) || continue
+            inds = getproperty(inter_list, name)
+            if length(inds) > 0 && (minimum(inds) < 1 || maximum(inds) > n_atoms)
+                throw(ArgumentError("the $name field of specific interaction list $li " *
+                                    "has atom indices outside the range 1 to $n_atoms " *
+                                    "(the number of atoms in the system)"))
+            end
+        end
     end
 end
 
@@ -835,6 +948,14 @@ The minimal required arguments are `atoms`, `coords` and `boundary`.
 `atoms_data` if these are provided.
 This is a sub-type of `AbstractSystem` from AtomsBase.jl and implements the
 interface described there.
+
+The arguments have to be consistent with each other and errors are thrown when
+they are not. In particular `coords` and `velocities` should have the same number
+of dimensions as `boundary`, should use the same float type as `float_type`, and
+should be on the same device (CPU or GPU) as `atoms`. The same applies to the
+arrays in `specific_inter_lists` and in the neighbor finder. Cases that are
+allowed but are often mistakes, such as an interaction cutoff more than half the
+minimum box side, are reported according to `strictness`.
 
 # Arguments
 - `atoms::A`: the atoms, or atom equivalents, in the system. Can be
@@ -873,9 +994,13 @@ interface described there.
     modified in some simulations. `k` is chosen based on the `energy_units` given.
 - `float_type::T`: the floating point type of the system, read from the boundary
     by default.
-- `float_type_high::TH=Float64`: the floating point type used for accumulation where
+- `float_type_high::TH`: the floating point type used for accumulation where
     higher precision is useful, such as the potential energy and the virial.
+    `Float64` by default, or `float_type` on backends that do not support
+    `Float64` such as Metal.
 - `data::DA=nothing`: arbitrary data associated with the system.
+- `grad_safe=false`: should be set to `true` if the system is going to be used
+    with Enzyme.jl.
 - `strictness=:warn`: determines behavior when encountering possible problems,
     options are `:warn` to emit warnings, `:nowarn` to suppress warnings or
     `:error` to error.
@@ -903,6 +1028,7 @@ mutable struct System{D, AT, T, TH, A, C, B, V, AD, TO, PI, SI, GI, CN, VS, VF, 
     masses::M
     total_mass::TM
     data::DA
+    grad_safe::Bool
     launch_config::CUDALaunchConfig
 end
 
@@ -924,10 +1050,11 @@ function System(;
                 energy_units=u"kJ * mol^-1",
                 k=default_k(energy_units),
                 float_type=float_type(boundary),
-                float_type_high=Float64,
+                float_type_high=default_float_type_high(coords, float_type),
                 data=nothing,
-                launch_config=CUDALaunchConfig(),
-                strictness=default_strictness())
+                grad_safe::Bool=false,
+                strictness=default_strictness(),
+                launch_config=CUDALaunchConfig())
     check_strictness(strictness)
     D = AtomsBase.n_dimensions(boundary)
     AT = array_type(coords)
@@ -952,10 +1079,10 @@ function System(;
 
     if isnothing(velocities)
         if force_units == NoUnits
-            vels = zero(coords)
+            vels = zero.(coords)
         else
             # Assume time units are ps
-            vels = zero(coords) * u"ps^-1"
+            vels = zero.(coords) * u"ps^-1"
         end
     else
         vels = velocities
@@ -971,29 +1098,47 @@ function System(;
     if length(atoms_data) > 0 && n_atoms != length(atoms_data)
         throw(ArgumentError("there are $n_atoms atoms but $(length(atoms_data)) atom data entries"))
     end
+    if !(eltype(coords) <: SVector)
+        throw(ArgumentError("the eltype of the coordinates should be a SVector type, " *
+                            "found $(eltype(coords))"))
+    end
+    if !(eltype(vels) <: SVector)
+        throw(ArgumentError("the eltype of the velocities should be a SVector type, " *
+                            "found $(eltype(vels))"))
+    end
+    check_n_dims(coords, vels, D)
 
-    if isa(atoms, AbstractGPUArray) && !isbitstype(eltype(atoms))
+    on_gpu = isa(atoms, AbstractGPUArray)
+    if on_gpu && !isbitstype(eltype(atoms))
         throw(ArgumentError("the atoms are on the GPU but are not a bits type, found " *
                             "atom type $(eltype(atoms))"))
     end
-    if isa(atoms, AbstractGPUArray) && !isa(coords, AbstractGPUArray)
+    if on_gpu && !isa(coords, AbstractGPUArray)
         throw(ArgumentError("the atoms are on the GPU but the coordinates are not"))
     end
-    if isa(coords, AbstractGPUArray) && !isa(atoms, AbstractGPUArray)
+    if isa(coords, AbstractGPUArray) && !on_gpu
         throw(ArgumentError("the coordinates are on the GPU but the atoms are not"))
     end
-    if isa(atoms, AbstractGPUArray) && !isa(vels, AbstractGPUArray)
+    if on_gpu && !isa(vels, AbstractGPUArray)
         throw(ArgumentError("the atoms are on the GPU but the velocities are not"))
     end
-    if isa(vels, AbstractGPUArray) && !isa(atoms, AbstractGPUArray)
+    if isa(vels, AbstractGPUArray) && !on_gpu
         throw(ArgumentError("the velocities are on the GPU but the atoms are not"))
     end
     if length(virtual_sites) > 0
-        if isa(atoms, AbstractGPUArray) && !isa(virtual_sites, AbstractGPUArray)
+        if on_gpu && !isa(virtual_sites, AbstractGPUArray)
             throw(ArgumentError("the atoms are on the GPU but the virtual sites are not"))
         end
-        if isa(virtual_sites, AbstractGPUArray) && !isa(atoms, AbstractGPUArray)
+        if isa(virtual_sites, AbstractGPUArray) && !on_gpu
             throw(ArgumentError("the virtual sites are on the GPU but the atoms are not"))
+        end
+    end
+
+    for (label, arr) in (("coordinates", coords), ("velocities", vels))
+        if isnan_svec_array(arr)
+            c = count(isnan_svec, arr)
+            err_str = "NaNs found in $label, $c out of $(length(arr)) contain a NaN"
+            report_issue(err_str, strictness; error_type=NaNSimulationError)
         end
     end
 
@@ -1029,6 +1174,14 @@ function System(;
         report_issue(err_str, strictness)
     end
 
+    check_specific_inter_lists(specific_inter_lists, n_atoms, on_gpu)
+    check_neighbor_finder(neighbor_finder, pairwise_inters, n_atoms, boundary, on_gpu, strictness)
+    max_sqdist = max_zero_beyond(pairwise_inters)
+    if !isnothing(max_sqdist) && !iszero(max_sqdist)
+        check_cutoff_box_size(sqrt(max_sqdist), boundary, strictness)
+    end
+    check_float_type_consistency(T, coords, vels, boundary, strictness)
+
     atom_masses = mass.(atoms)
     M = typeof(atom_masses)
     total_mass = sum(atom_masses)
@@ -1040,6 +1193,12 @@ function System(;
     if !isbitstype(eltype(coords)) || !isbitstype(eltype(vels))
         err_str = "eltype of coords or velocities is not isbits, it is recomended to use a " *
                   "vector of SVectors for performance"
+        report_issue(err_str, strictness)
+    end
+    if n_atoms > 0 && !isconcretetype(eltype(atoms))
+        err_str = "the atoms are not concretely typed, they have eltype $(eltype(atoms)). " *
+                  "This gives poor performance and can cause confusing errors elsewhere, " *
+                  "make sure that all the atoms have the same type."
         report_issue(err_str, strictness)
     end
 
@@ -1057,7 +1216,7 @@ function System(;
             end
         end
     end
-    constraints = Tuple(setup_constraints!(ca, neighbor_finder, AT) for ca in constraints)
+    constraints = map(ca -> setup_constraints!(ca, neighbor_finder, AT), constraints)
     CN = typeof(constraints)
 
     check_units(atoms, coords, vels, energy_units, force_units, pairwise_inters,
@@ -1068,7 +1227,7 @@ function System(;
                     atoms, coords, boundary, vels, atoms_data, topology, pairwise_inters,
                     specific_inter_lists, general_inters, constraints, virtual_sites,
                     virtual_site_flags, neighbor_finder, loggers, df, force_units, energy_units,
-                    k_converted, atom_masses, total_mass, data, launch_config)
+                    k_converted, atom_masses, total_mass, data, grad_safe, launch_config)
 end
 
 """
@@ -1099,8 +1258,9 @@ function System(sys::System{<:Any, <:Any, T, TH};
                 float_type=T,
                 float_type_high=TH,
                 data=sys.data,
-                launch_config=sys.launch_config,
-                strictness=default_strictness()) where {T, TH}
+                grad_safe=sys.grad_safe,
+                strictness=default_strictness(),
+                launch_config=sys.launch_config) where {T, TH}
     return System(
         atoms=atoms,
         coords=coords,
@@ -1121,8 +1281,9 @@ function System(sys::System{<:Any, <:Any, T, TH};
         float_type=float_type,
         float_type_high=float_type_high,
         data=data,
-        launch_config=launch_config,
+        grad_safe=grad_safe,
         strictness=strictness,
+        launch_config=launch_config,
     )
 end
 
@@ -1152,6 +1313,7 @@ function System(crystal::Crystal{D};
                 k=default_k(energy_units),
                 float_type_high=Float64,
                 data=nothing,
+                grad_safe::Bool=false,
                 launch_config=CUDALaunchConfig()) where D
     atoms = [Atom(index=i, charge=ustrip(uconvert(u"C", charge(a)) / Unitful.q), mass=AtomsBase.mass(a))
              for (i, a) in enumerate(crystal.atoms)]
@@ -1165,11 +1327,12 @@ function System(crystal::Crystal{D};
     elseif any(typeof(crystal.lattice.crystal_family) .<: [SquareLattice, RectangularLattice])
         boundary = RectangularBoundary(side_lengths...)
     elseif D == 2 # Honeycomb, Hex2D and Oblique
-        throw(ArgumentError("$(crystal.lattice.crystal_family) is not supported as it would need " *
-            "a 2D triclinic boundary, try defining the crystal with a rectangular or square unit cell"))
+        throw(ArgumentError("$(crystal.lattice.crystal_family) is not supported as it would " *
+                            "need a 2D triclinic boundary, try defining the crystal with a " *
+                            "rectangular or square unit cell"))
     else # 3D non-cubic systems
         if !all(crystal.lattice.crystal_family.lattice_angles .< 90u"°")
-            throw(error("all crystal lattice angles must be less than 90°"))
+            throw(ArgumentError("all crystal lattice angles must be less than 90°"))
         end
         boundary = TriclinicBoundary(side_lengths, crystal.lattice_angles)
     end
@@ -1192,6 +1355,7 @@ function System(crystal::Crystal{D};
         k=k,
         float_type_high=float_type_high,
         data=data,
+        grad_safe=grad_safe,
         launch_config=launch_config,
     )
 end
@@ -1222,63 +1386,10 @@ function Base.zero(sys::System{D, AT, T, TH, A, C, B, V,
         zero(sys.masses),
         zero(sys.total_mass),
         sys.data,
+        sys.grad_safe,
         sys.launch_config,
     )
 end
-
-# Add parameters from a dictionary to a system, allowing gradients to be tracked
-function inject_gradients(sys::System{<:Any, AT}, params_dic) where AT
-    atoms_grad = to_device(inject_atom.(from_device(sys.atoms), sys.atoms_data, (params_dic,)), AT)
-    if length(sys.pairwise_inters) > 0
-        pis_grad = inject_interaction.(sys.pairwise_inters, (params_dic,))
-    else
-        pis_grad = sys.pairwise_inters
-    end
-    if length(sys.specific_inter_lists) > 0
-        sis_grad = inject_interaction_list.(sys.specific_inter_lists, (params_dic,), AT)
-    else
-        sis_grad = sys.specific_inter_lists
-    end
-    if length(sys.general_inters) > 0
-        gis_grad = inject_interaction.(sys.general_inters, (params_dic,), (sys,))
-    else
-        gis_grad = sys.general_inters
-    end
-    return atoms_grad, pis_grad, sis_grad, gis_grad
-end
-
-inject_interaction(inter, args...) = inter
-
-# Form a dictionary of all parameters in a system, allowing gradients to be tracked
-function extract_parameters(sys, ff)
-    params_dic = Dict()
-
-    for at_data in sys.atoms_data
-        key_prefix = "atom_$(at_data.atom_type)_"
-        if !haskey(params_dic, key_prefix * "mass")
-            at = ff.atom_types[at_data.atom_type]
-            params_dic[key_prefix * "mass"] = at.mass
-            params_dic[key_prefix * "σ"   ] = at.σ
-            params_dic[key_prefix * "ϵ"   ] = at.ϵ
-        end
-    end
-
-    for inter in values(sys.pairwise_inters)
-        extract_parameters!(params_dic, inter, ff)
-    end
-
-    for inter in values(sys.specific_inter_lists)
-        extract_parameters!(params_dic, inter, ff)
-    end
-
-    for inter in values(sys.general_inters)
-        extract_parameters!(params_dic, inter, ff)
-    end
-
-    return params_dic
-end
-
-extract_parameters!(params_dic, inter, ff) = params_dic
 
 @doc raw"""
     ThermoState(system::System, integrator; <keyword arguments>)
@@ -1341,7 +1452,9 @@ function ThermoState(sys::System{<:Any, <:Any, <:Any, TH}, integrator;
     end
 
     if isnothing(temp_source)
-        throw(ArgumentError("No temperature provided or inferred from the integrator. " * "You must provide an explicit temperature, use a thermostat, or " * "use an integrator with an implicit temperature."))
+        throw(ArgumentError("no temperature provided or inferred from the integrator; " *
+                            "you must provide an explicit temperature, use a thermostat or " *
+                            "use an integrator with an implicit temperature"))
     end
 
     # Calculate beta (inverse temperature) in system-compatible units (e.g., mol/kJ)
@@ -1349,9 +1462,9 @@ function ThermoState(sys::System{<:Any, <:Any, <:Any, TH}, integrator;
     kBT_raw = Unitful.R * temp_source
     
     if Unitful.dimension(sys.energy_units) != Unitful.dimension(kBT_raw)
-        throw(ArgumentError("Temperature provided is not compatible with system energy units. " *
-                            "Expected dimension $(Unitful.dimension(sys.energy_units)), " *
-                            "but got $(Unitful.dimension(kBT_raw))."))
+        throw(ArgumentError("temperature provided is not compatible with system energy units; " *
+                            "expected dimension $(Unitful.dimension(sys.energy_units)), " *
+                            "but got $(Unitful.dimension(kBT_raw))"))
     end
 
     kBT = uconvert(sys.energy_units, kBT_raw)
@@ -1451,11 +1564,11 @@ function ReplicaSystem(thermo_states::AbstractArray{<:ThermoState},
                        data=nothing,
                        reuse_neighbors::Bool=true)
     n_replicas = length(thermo_states)
-    initial_step >= 0 || throw(ArgumentError("initial_step must be non-negative."))
+    initial_step >= 0 || throw(ArgumentError("initial_step must be non-negative"))
     
     if length(replica_coords) != n_replicas
-        throw(ArgumentError("Number of replica_coords ($(length(replica_coords))) " *
-                            "does not match number of ThermoStates ($n_replicas)"))
+        throw(ArgumentError("number of replica_coords ($(length(replica_coords))) " *
+                            "does not match number of thermo_states ($n_replicas)"))
     end
 
     ref_sys = thermo_states[1].system
@@ -1468,7 +1581,7 @@ function ReplicaSystem(thermo_states::AbstractArray{<:ThermoState},
     if isnothing(replica_boundaries)
         replica_boundaries = [ref_sys.boundary for _ in 1:n_replicas]
     elseif length(replica_boundaries) != n_replicas
-        throw(ArgumentError("Number of boundaries ($(length(replica_boundaries))) " *
+        throw(ArgumentError("number of boundaries ($(length(replica_boundaries))) " *
                             "does not match number of replicas ($n_replicas)"))
     end
 
@@ -1479,21 +1592,21 @@ function ReplicaSystem(thermo_states::AbstractArray{<:ThermoState},
             replica_velocities = [zero(replica_coords[1]) * u"ps^-1" for _ in 1:n_replicas]
         end
     elseif length(replica_velocities) != n_replicas
-        throw(ArgumentError("Number of velocities ($(length(replica_velocities))) " *
+        throw(ArgumentError("number of velocities ($(length(replica_velocities))) " *
                             "does not match number of replicas ($n_replicas)"))
     end
 
     if isnothing(replica_neighbor_finders)
         replica_neighbor_finders = [deepcopy(ts.system.neighbor_finder) for ts in thermo_states]
     elseif length(replica_neighbor_finders) != n_replicas
-        throw(ArgumentError("Number of neighbor finders ($(length(replica_neighbor_finders))) " *
+        throw(ArgumentError("number of neighbor finders ($(length(replica_neighbor_finders))) " *
                             "does not match number of replicas ($n_replicas)"))
     end
 
     if isnothing(replica_loggers)
         replica_loggers = [() for _ in 1:n_replicas]
     elseif length(replica_loggers) != n_replicas
-        throw(ArgumentError("Number of loggers arrays ($(length(replica_loggers))) " *
+        throw(ArgumentError("number of loggers arrays ($(length(replica_loggers))) " *
                             "does not match number of replicas ($n_replicas)"))
     end
     validate_replica_loggers(replica_loggers)
@@ -1522,7 +1635,7 @@ function ReplicaSystem(thermo_states::AbstractArray{<:ThermoState},
         partition, n_replicas, betas, integrators, replica_coords, replica_velocities, 
         replica_boundaries, replica_neighbor_finders, replica_loggers, 
         state_pairwise_inters, state_specific_inter_lists, state_general_inters,
-        state_indices, exchange_logger, Int(initial_step), true, data
+        state_indices, exchange_logger, Int(initial_step), true, data,
     )
 end
 
@@ -1542,6 +1655,7 @@ end
 
 # Avoid unnecessary Array calls on CPU
 from_device(x::Array) = x
+from_device(x::BitArray) = x
 from_device(x) = Array(x)
 from_device(x::StructArray) = replace_storage(Array, x)
 
@@ -1808,6 +1922,7 @@ function System(sys::AtomsBase.AbstractSystem{D};
                 k=default_k(energy_units),
                 float_type_high=Float64,
                 data=nothing,
+                grad_safe::Bool=false,
                 launch_config=CUDALaunchConfig()) where D
     bb = AtomsBase.cell_vectors(sys)
     is_cubic = true
@@ -1837,18 +1952,15 @@ function System(sys::AtomsBase.AbstractSystem{D};
     end
 
     length_unit = unit(first(AtomsBase.position(sys, 1)))
-    atoms = Vector{Atom}(undef, length(sys))
-    atoms_data = Vector{AtomData}(undef, length(sys))
-    for (i, atom) in enumerate(sys)
-        atoms[i] = Atom(
-            index=i,
-            charge=ustrip(get(atom, :charge, 0.0)), # Remove e unit
-            mass=AtomsBase.mass(atom),
-            σ=(0.0 * length_unit),
-            ϵ=(0.0 * energy_units),
-        )
-        atoms_data[i] = AtomData(element=String(Symbol(AtomsBase.atomic_symbol(atom))))
-    end
+    atoms = [Atom(
+        index=i,
+        charge=ustrip(get(atom, :charge, 0.0)), # Remove e unit
+        mass=AtomsBase.mass(atom),
+        σ=(0.0 * length_unit),
+        ϵ=(0.0 * energy_units),
+    ) for (i, atom) in enumerate(sys)]
+    atoms_data = [AtomData(element=String(Symbol(AtomsBase.atomic_symbol(atom))))
+                  for atom in sys]
 
     # AtomsBase does not specify a type for coordinates or velocities so we convert to SVector
     if !(:position in AtomsBase.atomkeys(sys))
@@ -1894,6 +2006,7 @@ function System(sys::AtomsBase.AbstractSystem{D};
         k=k,
         float_type_high=float_type_high,
         data=data,
+        grad_safe=grad_safe,
         launch_config=launch_config,
     )
 end
@@ -2082,10 +2195,10 @@ function check_strictness(strictness)
     end
 end
 
-function report_issue(err_str, strictness; maxlog=nothing)
+function report_issue(err_str, strictness; error_type=ErrorException, maxlog=nothing)
     if strictness == :warn
         @warn err_str maxlog=maxlog
     elseif strictness == :error
-        error(err_str)
+        throw(error_type(err_str))
     end
 end

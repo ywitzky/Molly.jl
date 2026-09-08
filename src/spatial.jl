@@ -301,6 +301,9 @@ Unitful.ustrip(b::CubicBoundary) = CubicBoundary(ustrip.(b.side_lengths))
 Unitful.ustrip(u::Unitful.Units, b::CubicBoundary) = CubicBoundary(ustrip.(u, b.side_lengths))
 Unitful.ustrip(b::RectangularBoundary) = RectangularBoundary(ustrip.(b.side_lengths))
 Unitful.ustrip(u::Unitful.Units, b::RectangularBoundary) = RectangularBoundary(ustrip.(u, b.side_lengths))
+Unitful.ustrip(b::TriclinicBoundary) = TriclinicBoundary(map(bv -> ustrip.(bv), b.basis_vectors))
+Unitful.ustrip(u::Unitful.Units, b::TriclinicBoundary) = TriclinicBoundary(
+                                            map(bv -> ustrip.(u, bv), b.basis_vectors))
 
 function AtomsBase.cell_vectors(b::CubicBoundary{3, <:Any, C}) where C
     z = zero(C)
@@ -1005,7 +1008,7 @@ end
              recompute=true, n_threads=Threads.nthreads(),
              pairwise_inters=system.pairwise_inters,
              specific_inter_lists=system.specific_inter_lists,
-             general_inters=system.general_inters)
+             general_inters=system.general_inters, strictness=:warn)
 
 Calculate the pressure tensor of the system.
 
@@ -1096,7 +1099,7 @@ end
                     recompute=true, n_threads=Threads.nthreads(),
                     pairwise_inters=system.pairwise_inters,
                     specific_inter_lists=system.specific_inter_lists,
-                    general_inters=system.general_inters)
+                    general_inters=system.general_inters, strictness=:warn)
 
 Calculate the pressure of the system as a scalar.
 
@@ -1127,7 +1130,7 @@ function molecule_centers(coords::AbstractArray{SVector{D,C}}, boundary, topolog
 
     is_triclinic = hasproperty(boundary, :basis_vectors)
     if is_triclinic && D != 3
-        error("Triclinic boundary only defined for 3-dimensions")
+        error("triclinic boundary only defined for 3-dimensions")
     end
 
     # Build frac<->cart transforms
@@ -1254,17 +1257,18 @@ Rigid-molecular barostat update with optional rotation.
 - Positions:  r′ = μ * r  (implemented via COM affine + optional rotation of internal offsets)
 - Velocities: v′ = μ⁻¹ * v  (applied when `scale_velocities=true`)
 """
-function scale_coords!(sys::System{<:Any, AT},
-                       μ::SMatrix{D, D};
+function scale_coords!(sys::System{<:Any, AT, T},
+                       μ_in::SMatrix{D, D};
                        rotate::Bool=true,
                        ignore_molecules::Bool=false,
-                       scale_velocities::Bool=false) where {AT, D}
+                       scale_velocities::Bool=false) where {AT, T, D}
     # This function assumes that constrained atoms, and virtual sites and the atoms that
     #   define them, are in the same molecule, meaning that they are scaled appropriately
     if has_infinite_boundary(sys.boundary)
-        throw(AssertionError("infinite boundary not supported"))
+        throw(ArgumentError("infinite boundary not supported for scale_coords!"))
     end
 
+    μ = SMatrix{D, D, T}(μ_in) # Convert scaling matrix to float type of the system
     μinv = inv(μ)
 
     if ignore_molecules || isnothing(sys.topology)

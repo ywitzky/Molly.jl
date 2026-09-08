@@ -20,7 +20,7 @@ calc_accels(f, m) = (iszero(m) ? zero(f / oneunit(m)) : (f / m))
     accelerations(system, neighbors=find_neighbors(system), step_n=0;
                   n_threads=Threads.nthreads(), pairwise_inters=system.pairwise_inters,
                   specific_inter_lists=system.specific_inter_lists,
-                  general_inters=system.general_inters)
+                  general_inters=system.general_inters, strictness=:warn)
 
 Calculate the accelerations of all atoms in a system using the pairwise,
 specific and general interactions and Newton's second law of motion.
@@ -558,6 +558,7 @@ mutable struct BuffersGPU{F, P, V, VN, KT, PT, C, M, R, IT, ITT, ITD, NIT, OIT, 
     velocities_reordered::VR
     atoms_reordered::AR
     fs_mat_reordered::fs_re
+    grad_scratch::Base.RefValue{Any}
     step_n_preprocessed::Int
     sparse_pair_generation::UInt64
     num_pairs::Int
@@ -588,8 +589,9 @@ function BuffersGPU(fs_mat, pe_vec_nounits, virial, virial_nounits, kin_tensor, 
                       interacting_tiles_j, interacting_tiles_type, interacting_tiles_diag,
                       num_interacting_tiles,
                       interacting_tiles_overflow, coords_reordered, velocities_reordered,
-                      atoms_reordered, fs_mat_reordered, step_n_preprocessed,
-                      sparse_pair_generation, num_pairs, masks_initialized)
+                      atoms_reordered, fs_mat_reordered, Base.RefValue{Any}(nothing),
+                      step_n_preprocessed, sparse_pair_generation, num_pairs,
+                      masks_initialized)
 end
 
 function clear_constraint_virial!(buffers::BuffersCPU, step_n::Integer)
@@ -694,7 +696,7 @@ function init_buffers!(sys::System{D, <:AbstractGPUArray, T, TH}, n_threads,
 
     coords_reordered = zero(sys.coords)
     velocities_reordered = zero(sys.velocities)
-    atoms_reordered = zero(sys.atoms)
+    atoms_reordered = zero.(sys.atoms)
 
     if !for_pe && sys.neighbor_finder isa GPUNeighborFinder
         sys.neighbor_finder.initialized = false
@@ -711,10 +713,11 @@ function init_buffers!(sys::System{D, <:AbstractGPUArray, T, TH}, n_threads,
                       interacting_tiles_j, interacting_tiles_type, interacting_tiles_diag,
                       num_interacting_tiles,
                       interacting_tiles_overflow, coords_reordered, velocities_reordered,
-                      atoms_reordered, fs_mat_reordered, -1, UInt64(0), 0, false)
+                      atoms_reordered, fs_mat_reordered, Base.RefValue{Any}(nothing),
+                      -1, UInt64(0), 0, false)
 end
 
-zero_forces(sys) = ustrip_vec.(zero(sys.coords)) .* sys.force_units
+zero_forces(sys) = ustrip_vec.(zero.(sys.coords)) .* sys.force_units
 
 # Generic (CPU) fallback: calls forces! directly. Overridden for CuArray systems in
 # MollyCUDAExt.jl with a CUDA.@captured-wrapped body
@@ -735,7 +738,7 @@ invalidate_cuda_graph_cache!(buffers) = nothing
     forces(system, neighbors=find_neighbors(system), step_n=0;
            n_threads=Threads.nthreads(), pairwise_inters=system.pairwise_inters,
            specific_inter_lists=system.specific_inter_lists,
-           general_inters=system.general_inters)
+           general_inters=system.general_inters, strictness=:warn)
 
 Calculate the forces on all atoms in a system using the pairwise, specific and
 general interactions.
@@ -755,7 +758,7 @@ end
     forces_virial(system, neighbors=find_neighbors(system), step_n=0;
                   n_threads=Threads.nthreads(), pairwise_inters=system.pairwise_inters,
                   specific_inter_lists=system.specific_inter_lists,
-                  general_inters=system.general_inters)
+                  general_inters=system.general_inters, strictness=:warn)
 
 Calculate the forces on all atoms in a system and the virial using the pairwise,
 specific and general interactions.
@@ -793,7 +796,8 @@ function forces!(fs,
                  n_threads::Integer=Threads.nthreads(),
                  pairwise_inters=sys.pairwise_inters,
                  specific_inter_lists=sys.specific_inter_lists,
-                 general_inters=sys.general_inters) where {T, TH, needs_vir}
+                 general_inters=sys.general_inters,
+                 strictness=default_strictness()) where {T, TH, needs_vir}
     if needs_vir
         fill!(buffers.virial, zero(TH) * sys.energy_units)
     else
@@ -826,8 +830,8 @@ function forces!(fs,
         with_pairwise_partition(values(pairwise_inters)) do pis_nonl, pis_nl
             pairwise_forces_loop!(buffers.fs_nounits, buffers.fs_chunks, buffers.vir_nounits,
                     buffers.vir_chunks, sys.atoms, sys.coords, sys.velocities, sys.boundary,
-                    neighbors, sys.force_units, length(sys), pis_nonl,
-                    pis_nl, step_n, Val(n_threads), Val(needs_vir), Val(use_vel))
+                    neighbors, sys.force_units, length(sys), pis_nonl, pis_nl, step_n,
+                    Val(n_threads), Val(needs_vir), Val(use_vel), Val(sys.grad_safe))
         end
     end
 
@@ -856,7 +860,8 @@ function forces!(fs,
 
     for inter in values(general_inters)
         AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
-                                 n_threads=n_threads, buffers=buffers, needs_vir=needs_vir)
+                                 n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
+                                 strictness=strictness)
     end
     distribute_forces!(fs, sys, buffers)
 
@@ -893,7 +898,7 @@ end
 function pairwise_forces_loop!(fs_nounits, fs_chunks, vir_nounits, vir_chunks, atoms, coords,
                                velocities, boundary, neighbors, force_units, n_atoms,
                                pairwise_inters_nonl, pairwise_inters_nl, step_n, ::Val{1},
-                               ::Val{needs_vir}, ::Val{use_vel}) where {needs_vir, use_vel}
+                               ::Val{needs_vir}, ::Val{use_vel}, ::Val) where {needs_vir, use_vel}
     @inbounds if length(pairwise_inters_nonl) > 0
         sqdist_cutoff = max_zero_beyond(pairwise_inters_nonl)
         for i in 1:n_atoms
@@ -955,7 +960,8 @@ end
 function pairwise_forces_loop!(fs_nounits, fs_chunks, vir_nounits, vir_chunks, atoms, coords,
                                velocities, boundary, neighbors, force_units, n_atoms,
                                pairwise_inters_nonl, pairwise_inters_nl, step_n, ::Val{n_threads},
-                               ::Val{needs_vir}, ::Val{use_vel}) where {n_threads, needs_vir, use_vel}
+                               ::Val{needs_vir}, ::Val{use_vel},
+                               ::Val{grad_safe}) where {n_threads, needs_vir, use_vel, grad_safe}
     if isnothing(fs_chunks) || (needs_vir && isnothing(vir_chunks))
         throw(ArgumentError("fs_chunks / vir_chunks is not set but n_threads is > 1"))
     end
@@ -983,8 +989,9 @@ function pairwise_forces_loop!(fs_nounits, fs_chunks, vir_nounits, vir_chunks, a
         block_size = 512
         next_block_start = Threads.Atomic{Int}(1)
         sqdist_cutoff_nl = max_zero_beyond(pairwise_inters_nl)
-        @sync for chunk_i in 1:n_threads
-            Threads.@spawn begin
+        if grad_safe
+            # Enzyme struggles with tasks
+            Threads.@threads for chunk_i in 1:n_threads
                 fs_chunk = fs_chunks[chunk_i]
                 vir_chunk = (needs_vir ? vir_chunks[chunk_i] : nothing)
                 while true
@@ -994,6 +1001,21 @@ function pairwise_forces_loop!(fs_nounits, fs_chunks, vir_nounits, vir_chunks, a
                     pairwise_forces_nl_block!(fs_chunk, vir_chunk, atoms, coords, velocities, boundary,
                                     force_units, neighbors, pairwise_inters_nl, step_n, block_start,
                                     block_stop, sqdist_cutoff_nl, Val(needs_vir), Val(use_vel))
+                end
+            end
+        else
+            @sync for chunk_i in 1:n_threads
+                Threads.@spawn begin
+                    fs_chunk = fs_chunks[chunk_i]
+                    vir_chunk = (needs_vir ? vir_chunks[chunk_i] : nothing)
+                    while true
+                        block_start = Threads.atomic_add!(next_block_start, block_size)
+                        block_start > n_neighbors && break
+                        block_stop = min(block_start + block_size - 1, n_neighbors)
+                        pairwise_forces_nl_block!(fs_chunk, vir_chunk, atoms, coords, velocities, boundary,
+                                        force_units, neighbors, pairwise_inters_nl, step_n, block_start,
+                                        block_stop, sqdist_cutoff_nl, Val(needs_vir), Val(use_vel))
+                    end
                 end
             end
         end
@@ -1193,34 +1215,49 @@ function specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, vel
     return fs_nounits
 end
 
+# Walked recursively rather than with a loop to avoid a possible `Union`
+@inline specific_forces_lists!(::Tuple{}, fs_nounits, vir_nounits, atoms, coords,
+                               velocities, boundary, force_units, step_n,
+                               needs_vir::Val) = nothing
+
+@inline function specific_forces_lists!(inter_lists::Tuple, fs_nounits, vir_nounits, atoms,
+                                        coords, velocities, boundary, force_units, step_n,
+                                        needs_vir::Val)
+    inter_list = first(inter_lists)
+    specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, velocities, boundary,
+                force_units, step_n, inter_list, eachindex(inter_list.inters), needs_vir)
+    return specific_forces_lists!(Base.tail(inter_lists), fs_nounits, vir_nounits, atoms,
+                                  coords, velocities, boundary, force_units, step_n, needs_vir)
+end
+
+@inline specific_forces_lists_chunk!(::Tuple{}, fs_chunk, vir_chunk, atoms, coords,
+                                     velocities, boundary, force_units, step_n, chunk_i,
+                                     n_chunks, needs_vir::Val) = nothing
+
+@inline function specific_forces_lists_chunk!(inter_lists::Tuple, fs_chunk, vir_chunk, atoms,
+                                              coords, velocities, boundary, force_units,
+                                              step_n, chunk_i, n_chunks, needs_vir::Val)
+    inter_list = first(inter_lists)
+    cr = chunk_range(length(inter_list.inters), chunk_i, n_chunks)
+    specific_forces_inter_list!(fs_chunk, vir_chunk, atoms, coords, velocities, boundary,
+                                force_units, step_n, inter_list, cr, needs_vir)
+    return specific_forces_lists_chunk!(Base.tail(inter_lists), fs_chunk, vir_chunk, atoms,
+                    coords, velocities, boundary, force_units, step_n, chunk_i, n_chunks,
+                    needs_vir)
+end
+
 function specific_forces_loop!(fs_nounits, fs_chunks, vir_nounits, vir_chunks, atoms, coords,
                                velocities, boundary, force_units, sils_1_atoms, sils_2_atoms,
                                sils_3_atoms, sils_4_atoms, sils_5_atoms, step_n, ::Val{1},
                                ::Val{needs_vir}) where needs_vir
-    for inter_list in sils_1_atoms
-        specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, velocities, boundary,
-                    force_units, step_n, inter_list, eachindex(inter_list.inters), Val(needs_vir))
-    end
+    args = (fs_nounits, vir_nounits, atoms, coords, velocities, boundary, force_units,
+            step_n, Val(needs_vir))
 
-    for inter_list in sils_2_atoms
-        specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, velocities, boundary,
-                    force_units, step_n, inter_list, eachindex(inter_list.inters), Val(needs_vir))
-    end
-
-    for inter_list in sils_3_atoms
-        specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, velocities, boundary,
-                    force_units, step_n, inter_list, eachindex(inter_list.inters), Val(needs_vir))
-    end
-
-    for inter_list in sils_4_atoms
-        specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, velocities, boundary,
-                    force_units, step_n, inter_list, eachindex(inter_list.inters), Val(needs_vir))
-    end
-
-    for inter_list in sils_5_atoms
-        specific_forces_inter_list!(fs_nounits, vir_nounits, atoms, coords, velocities, boundary,
-                    force_units, step_n, inter_list, eachindex(inter_list.inters), Val(needs_vir))
-    end
+    specific_forces_lists!(sils_1_atoms, args...)
+    specific_forces_lists!(sils_2_atoms, args...)
+    specific_forces_lists!(sils_3_atoms, args...)
+    specific_forces_lists!(sils_4_atoms, args...)
+    specific_forces_lists!(sils_5_atoms, args...)
 
     return fs_nounits
 end
@@ -1244,54 +1281,87 @@ function specific_forces_loop!(fs_nounits, fs_chunks, vir_nounits, vir_chunks, a
                             "($(length(vir_chunks))) does not match n_threads ($n_threads)"))
     end
 
-    @sync for chunk_i in 1:n_threads
-        Threads.@spawn begin
-            fs_chunk = fs_chunks[chunk_i]
-            vir_chunk = (needs_vir ? vir_chunks[chunk_i] : nothing)
-            for inter_list in sils_1_atoms
-                cr = chunk_range(length(inter_list.inters), chunk_i, n_threads)
-                specific_forces_inter_list!(fs_chunk, vir_chunk, atoms, coords, velocities,
-                            boundary, force_units, step_n, inter_list, cr, Val(needs_vir))
-            end
-            for inter_list in sils_2_atoms
-                cr = chunk_range(length(inter_list.inters), chunk_i, n_threads)
-                specific_forces_inter_list!(fs_chunk, vir_chunk, atoms, coords, velocities,
-                            boundary, force_units, step_n, inter_list, cr, Val(needs_vir))
-            end
-            for inter_list in sils_3_atoms
-                cr = chunk_range(length(inter_list.inters), chunk_i, n_threads)
-                specific_forces_inter_list!(fs_chunk, vir_chunk, atoms, coords, velocities,
-                            boundary, force_units, step_n, inter_list, cr, Val(needs_vir))
-            end
-            for inter_list in sils_4_atoms
-                cr = chunk_range(length(inter_list.inters), chunk_i, n_threads)
-                specific_forces_inter_list!(fs_chunk, vir_chunk, atoms, coords, velocities,
-                            boundary, force_units, step_n, inter_list, cr, Val(needs_vir))
-            end
-            for inter_list in sils_5_atoms
-                cr = chunk_range(length(inter_list.inters), chunk_i, n_threads)
-                specific_forces_inter_list!(fs_chunk, vir_chunk, atoms, coords, velocities,
-                            boundary, force_units, step_n, inter_list, cr, Val(needs_vir))
-            end
-        end
+    Threads.@threads for chunk_i in 1:n_threads
+        fs_chunk = fs_chunks[chunk_i]
+        vir_chunk = (needs_vir ? vir_chunks[chunk_i] : nothing)
+        args = (fs_chunk, vir_chunk, atoms, coords, velocities, boundary, force_units,
+                step_n, chunk_i, n_threads, Val(needs_vir))
+        specific_forces_lists_chunk!(sils_1_atoms, args...)
+        specific_forces_lists_chunk!(sils_2_atoms, args...)
+        specific_forces_lists_chunk!(sils_3_atoms, args...)
+        specific_forces_lists_chunk!(sils_4_atoms, args...)
+        specific_forces_lists_chunk!(sils_5_atoms, args...)
     end
 
     return fs_nounits
 end
 
 function forces!(fs,
-                 sys::System{D, <:AbstractGPUArray, T, TH},
+                 sys::System{<:Any, <:AbstractGPUArray},
                  neighbors,
                  step_n::Integer,
                  buffers::BuffersGPU,
-                 ::Val{needs_vir};
+                 needs_vir_val::Val{needs_vir};
                  n_threads::Integer=Threads.nthreads(),
                  pairwise_inters=sys.pairwise_inters,
                  specific_inter_lists=sys.specific_inter_lists,
                  general_inters=sys.general_inters,
                  cuda_graph_capturing::Bool=false,
                  defer_finite_check::Bool=false,
-                 bias_check::Bool=true) where {D, T, TH, needs_vir}
+                 bias_check::Bool=true,
+                 strictness=default_strictness()) where needs_vir
+    # Allow an Enzyme reverse rule
+    gpu_forces!(fs, sys, neighbors, step_n, buffers, needs_vir_val, pairwise_inters,
+                specific_inter_lists, n_threads)
+
+    # Compute unwrap_molecules(sys) at most once here, shared by every attached BiasPotential
+    # that needs it (correction==:pbc), instead of each recomputing it independently below.
+    if any(bias_needs_unwrap, values(general_inters))
+        ensure_unwrapped_coords!(buffers, sys, step_n)
+    end
+    if cuda_graph_capturing
+        # Batches all biases' captured-path tail into 2 launches instead of 2*n_bias.
+        biases, other_inters = split_biases(values(general_inters))
+        for bias in biases
+            coords = bias_coords(sys, bias.cv_type, buffers, step_n)
+            bias_cv_step!(bias, sys, coords, fs, step_n, bias_check)
+        end
+        bias_batched_tail!(fs, biases, step_n, bias_check)
+        for inter in other_inters
+            AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
+                                     n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
+                                     cuda_graph_capturing=cuda_graph_capturing,
+                                     defer_finite_check=defer_finite_check, strictness=strictness)
+        end
+    else
+        for inter in values(general_inters)
+            AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
+                                     n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
+                                     cuda_graph_capturing=cuda_graph_capturing,
+                                     defer_finite_check=defer_finite_check, strictness=strictness)
+        end
+    end
+    distribute_forces!(fs, sys, buffers)
+
+    if needs_vir
+        mark_interaction_virial!(buffers.validity, step_n)
+        if length(sys.constraints) == 0
+            mark_total_virial!(buffers.validity, step_n)
+        end
+    end
+
+    return fs, buffers
+end
+
+function gpu_forces!(fs,
+                     sys::System{D, <:AbstractGPUArray, T, TH},
+                     neighbors,
+                     step_n::Integer,
+                     buffers::BuffersGPU,
+                     ::Val{needs_vir},
+                     pairwise_inters,
+                     specific_inter_lists,
+                     n_threads::Integer) where {D, T, TH, needs_vir}
     if needs_vir
         fill!(buffers.virial, zero(T) * sys.energy_units)
         fill!(buffers.virial_nounits, zero(TH))
@@ -1327,49 +1397,11 @@ function forces!(fs,
     if needs_vir
         buffers.virial .+= from_device(buffers.virial_nounits) .* sys.energy_units
     end
-
-    # Compute unwrap_molecules(sys) at most once here, shared by every attached BiasPotential
-    # that needs it (correction==:pbc), instead of each recomputing it independently below.
-    if any(bias_needs_unwrap, values(general_inters))
-        ensure_unwrapped_coords!(buffers, sys, step_n)
-    end
-    if cuda_graph_capturing
-        # Batches all biases' captured-path tail into 2 launches instead of 2*n_bias.
-        biases, other_inters = split_biases(values(general_inters))
-        for bias in biases
-            coords = bias_coords(sys, bias.cv_type, buffers, step_n)
-            bias_cv_step!(bias, sys, coords, fs, step_n, bias_check)
-        end
-        bias_batched_tail!(fs, biases, step_n, bias_check)
-        for inter in other_inters
-            AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
-                                     n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
-                                     cuda_graph_capturing=cuda_graph_capturing,
-                                     defer_finite_check=defer_finite_check)
-        end
-    else
-        for inter in values(general_inters)
-            AtomsCalculators.forces!(fs, sys, inter; neighbors=neighbors, step_n=step_n,
-                                     n_threads=n_threads, buffers=buffers, needs_vir=needs_vir,
-                                     cuda_graph_capturing=cuda_graph_capturing,
-                                     defer_finite_check=defer_finite_check)
-        end
-    end
-    distribute_forces!(fs, sys, buffers)
-
-    if needs_vir
-        mark_interaction_virial!(buffers.validity, step_n)
-        if length(sys.constraints) == 0
-            mark_total_virial!(buffers.validity, step_n)
-        end
-    end
-
-    return fs, buffers
 end
 
 """
     warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers, use_cuda_graph;
-                               n_threads)
+                               n_threads, strictness)
 
 Pre-materializes `BiasPotential` buffers and JIT-compiles captured-path kernels before the step
 loop's first capture, since CUDA graph capture allows neither mid-capture allocation nor
@@ -1377,12 +1409,13 @@ compilation. Two calls: one plain, one capturing, since only the latter reaches 
 Output is discarded; forces are recomputed on the loop's first iteration regardless.
 """
 @inline function warmup_cuda_graph_capture!(forces_t, sys, neighbors, init_step, buffers,
-                                            use_cuda_graph; n_threads)
+                                            use_cuda_graph; n_threads, strictness)
     if use_cuda_graph
         forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
-               n_threads=n_threads, defer_finite_check=true)
+               n_threads=n_threads, defer_finite_check=true, strictness=strictness)
         forces!(forces_t, sys, neighbors, init_step, buffers, Val(false);
-               n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true)
+               n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true,
+               strictness=strictness)
     end
     return nothing
 end
@@ -1398,21 +1431,21 @@ finiteness check every `finite_check_every` steps (`check_bias_finite_periodic_b
 `src/bias/bias.jl`).
 """
 @inline function forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step,
-                              ::Val{false}, has_bias_potential, finite_check_every; n_threads)
-    forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step); n_threads=n_threads)
+                              ::Val{false}, has_bias_potential, finite_check_every; n_threads, strictness)
+    forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step); n_threads=n_threads, strictness=strictness)
     return nothing
 end
 
 @inline function forces_step!(forces_t, sys, neighbors, step_n, buffers, needs_vir_step,
-                              ::Val{true}, has_bias_potential, finite_check_every; n_threads)
+                              ::Val{true}, has_bias_potential, finite_check_every; n_threads, strictness)
     run_bias_finite_check = has_bias_potential && step_n % finite_check_every == 0
     if !needs_vir_step && !is_tile_refresh_step(sys, buffers, step_n)
         captured_forces_once!(forces_t, sys, neighbors, step_n, buffers, Val(false);
                               n_threads=n_threads, cuda_graph_capturing=true, defer_finite_check=true,
-                              do_check=run_bias_finite_check)
+                              do_check=run_bias_finite_check, strictness=strictness)
     else
         forces!(forces_t, sys, neighbors, step_n, buffers, Val(needs_vir_step);
-               n_threads=n_threads, defer_finite_check=true)
+               n_threads=n_threads, defer_finite_check=true, strictness=strictness)
     end
     if run_bias_finite_check
         check_bias_finite_periodic_batched!(values(sys.general_inters))

@@ -19,31 +19,15 @@ Only compatible with 3D systems.
     θ0::D
 end
 
-Base.zero(::HarmonicTorsion{K, D}) where {K, D} = HarmonicTorsion(k=zero(K), θ0=zero(D))
+Base.zero(::Type{HarmonicTorsion{K, D}}) where {K, D} = HarmonicTorsion(k=zero(K), θ0=zero(D))
+Base.zero(t::HarmonicTorsion) = zero(typeof(t))
 
 Base.:+(t1::HarmonicTorsion, t2::HarmonicTorsion) = HarmonicTorsion(k=(t1.k + t2.k),
                                                                         θ0=(t1.θ0 + t2.θ0))
 
-function inject_interaction(inter::HarmonicTorsion, inter_type, params_dic)
-    key_prefix = "inter_HT_$(inter_type)_"
-    return HarmonicTorsion(
-        dict_get(params_dic, key_prefix * "k" , inter.k ),
-        dict_get(params_dic, key_prefix * "θ0", inter.θ0),
-    )
-end
+parameter_prefix(::HarmonicTorsion, inter_type) = "inter_HT_$(inter_type)_"
+parameter_fields(::Type{<:HarmonicTorsion}) = ((:k, "k"), (:θ0, "θ0"))
 
-function extract_parameters!(params_dic,
-                             inter::InteractionList4Atoms{<:Any, <:AbstractVector{<:HarmonicTorsion}},
-                             ff)
-    for (torsion_type, torsion) in zip(inter.types, from_device(inter.inters))
-        key_prefix = "inter_HT_$(torsion_type)_"
-        if !haskey(params_dic, key_prefix * "k")
-            params_dic[key_prefix * "k" ] = torsion.k
-            params_dic[key_prefix * "θ0"] = torsion.θ0
-        end
-    end
-    return params_dic
-end
 
 @inline function force(d::HarmonicTorsion, coords_i, coords_j, coords_k, coords_l,
                        boundary, args...)

@@ -30,6 +30,12 @@ export
     ReplicaExchangeLogger,
     MonteCarloLogger
 
+function check_run_loggers(run_loggers)
+    if !(run_loggers == true || run_loggers == false || run_loggers == :skipstart)
+        throw(ArgumentError("run_loggers must be true, false or :skipstart, found $run_loggers"))
+    end
+end
+
 """
     apply_loggers!(system, neighbors=nothing, step_n=0, buffers=nothing, run_loggers=true;
                    n_threads=Threads.nthreads(), strictness=:warn, kwargs...)
@@ -43,9 +49,7 @@ Additional keyword arguments can be passed to the loggers if required.
 function apply_loggers!(sys::System, neighbors=nothing, step_n::Integer=0, buffers=nothing,
                         run_loggers=true; n_threads::Integer=Threads.nthreads(),
                         strictness=default_strictness(), kwargs...)
-    if !(run_loggers in (true, false, :skipstart))
-        throw(ArgumentError("run_loggers must be true, false or :skipstart, found $run_loggers"))
-    end
+    check_run_loggers(run_loggers)
     if run_loggers == true || (run_loggers == :skipstart && step_n != 0)
         for logger in values(sys.loggers)
             log_property!(logger, sys, neighbors, step_n, buffers; n_threads=n_threads,
@@ -94,9 +98,10 @@ Custom loggers should implement this function.
 Additional keyword arguments can be passed to the logger if required.
 """
 function log_property!(logger::GeneralObservableLogger, s::System, neighbors=nothing,
-                        step_n::Integer=0, buffers=nothing; kwargs...)
+                        step_n::Integer=0, buffers=nothing;
+                        n_threads::Integer=Threads.nthreads(), kwargs...)
     if (step_n % logger.n_steps) == 0
-        obs = logger.observable(s, neighbors, step_n, buffers; kwargs...)
+        obs = logger.observable(s, neighbors, step_n, buffers; n_threads=n_threads, kwargs...)
         push!(logger.history, obs)
     end
 end
@@ -283,9 +288,9 @@ function Base.show(io::IO, el::GeneralObservableLogger{T, typeof(total_energy_wr
 end
 
 function forces_wrapper(sys, neighbors, step_n::Integer, buffers; n_threads::Integer,
-                        current_forces=nothing, kwargs...)
+                        strictness=default_strictness(), current_forces=nothing, kwargs...)
     if isnothing(current_forces)
-        return forces(sys, neighbors, step_n; n_threads=n_threads)
+        return forces(sys, neighbors, step_n; n_threads=n_threads, strictness=strictness)
     else
         return copy(current_forces)
     end
@@ -380,7 +385,8 @@ function constrained_virial_error(quantity, step_n)
     error("$quantity for constrained systems requires a valid total virial for step $step_n")
 end
 
-function virial_wrapper(sys, neighbors, step_n, buffers; n_threads, kwargs...)
+function virial_wrapper(sys, neighbors, step_n, buffers; n_threads,
+                        strictness=default_strictness(), kwargs...)
     if valid_total_virial(buffers, step_n)
         return copy(buffers.virial)
     elseif valid_pre_coupling_virial(buffers, step_n)
@@ -388,7 +394,7 @@ function virial_wrapper(sys, neighbors, step_n, buffers; n_threads, kwargs...)
     elseif length(sys.constraints) > 0
         constrained_virial_error("virial logging", step_n)
     else
-        return virial(sys, neighbors, step_n; n_threads=n_threads)
+        return virial(sys, neighbors, step_n; n_threads=n_threads, strictness=strictness)
     end
 end
 
@@ -409,7 +415,8 @@ function Base.show(io::IO, vl::GeneralObservableLogger{T, typeof(virial_wrapper)
             vl.n_steps, ", ", length(values(vl)), " virials recorded")
 end
 
-function scalar_virial_wrapper(sys, neighbors, step_n, buffers; n_threads, kwargs...)
+function scalar_virial_wrapper(sys, neighbors, step_n, buffers; n_threads,
+                               strictness=default_strictness(), kwargs...)
     if valid_total_virial(buffers, step_n)
         return tr(buffers.virial)
     elseif valid_pre_coupling_virial(buffers, step_n)
@@ -417,7 +424,7 @@ function scalar_virial_wrapper(sys, neighbors, step_n, buffers; n_threads, kwarg
     elseif length(sys.constraints) > 0
         constrained_virial_error("scalar virial logging", step_n)
     else
-        return scalar_virial(sys, neighbors, step_n; n_threads=n_threads)
+        return scalar_virial(sys, neighbors, step_n; n_threads=n_threads, strictness=strictness)
     end
 end
 
@@ -438,18 +445,21 @@ function Base.show(io::IO, vl::GeneralObservableLogger{T, typeof(scalar_virial_w
             vl.n_steps, ", ", length(values(vl)), " virials recorded")
 end
 
-function pressure_wrapper(sys, neighbors, step_n, buffers; n_threads, kwargs...)
+function pressure_wrapper(sys, neighbors, step_n, buffers; n_threads,
+                          strictness=default_strictness(), kwargs...)
     if valid_pressure(buffers, step_n)
         return copy(buffers.pres_tensor)
     elseif valid_total_virial(buffers, step_n)
-        P = pressure(sys, neighbors, step_n, buffers; recompute=false, n_threads=n_threads)
+        P = pressure(sys, neighbors, step_n, buffers; recompute=false, n_threads=n_threads,
+                     strictness=strictness)
         return copy(P)
     elseif valid_pre_coupling_pressure(buffers, step_n)
         return copy(pre_coupling_pressure!(buffers, sys, step_n))
     elseif length(sys.constraints) > 0
         constrained_virial_error("pressure logging", step_n)
     else
-        P = pressure(sys, neighbors, step_n, buffers; recompute=true, n_threads=n_threads)
+        P = pressure(sys, neighbors, step_n, buffers; recompute=true, n_threads=n_threads,
+                     strictness=strictness)
         return copy(P)
     end
 end
@@ -475,18 +485,19 @@ function Base.show(io::IO, pl::GeneralObservableLogger{T, typeof(pressure_wrappe
 end
 
 function scalar_pressure_wrapper(sys::System{D}, neighbors, step_n, buffers; n_threads,
-                                 kwargs...) where D
+                                 strictness=default_strictness(), kwargs...) where D
     if valid_pressure(buffers, step_n)
         return tr(buffers.pres_tensor) / D
     elseif valid_total_virial(buffers, step_n)
         return scalar_pressure(sys, neighbors, step_n, buffers; recompute=false,
-                               n_threads=n_threads)
+                               n_threads=n_threads, strictness=strictness)
     elseif valid_pre_coupling_pressure(buffers, step_n)
         return tr(pre_coupling_pressure!(buffers, sys, step_n)) / D
     elseif length(sys.constraints) > 0
         constrained_virial_error("scalar pressure logging", step_n)
     else
-        return scalar_pressure(sys, neighbors, step_n, buffers; n_threads=n_threads)
+        return scalar_pressure(sys, neighbors, step_n, buffers; n_threads=n_threads,
+                               strictness=strictness)
     end
 end
 
@@ -917,8 +928,7 @@ function validate_replica_loggers(replica_loggers)
                 prev_i = get(seen_paths, filepath, nothing)
                 if !isnothing(prev_i) && prev_i != replica_i
                     throw(ArgumentError("replica_loggers cannot contain multiple " *
-                                        "TrajectoryWriters with the same filepath " *
-                                        "($filepath)"))
+                                        "TrajectoryWriters with the same filepath ($filepath)"))
                 end
                 seen_paths[filepath] = replica_i
             end
@@ -1134,9 +1144,10 @@ function Base.values(aol::AverageObservableLogger; std::Bool=true)
 end
 
 function log_property!(aol::AverageObservableLogger{T}, s::System, neighbors=nothing,
-                        step_n::Integer=0, buffers=nothing; kwargs...) where T
+                        step_n::Integer=0, buffers=nothing;
+                        n_threads::Integer=Threads.nthreads(), kwargs...) where T
     if (step_n % aol.n_steps) == 0
-        obs = aol.observable(s, neighbors, step_n, buffers; kwargs...)
+        obs = aol.observable(s, neighbors, step_n, buffers; n_threads=n_threads, kwargs...)
         push!(aol.current_block, obs)
 
         if length(aol.current_block) == aol.current_block_size

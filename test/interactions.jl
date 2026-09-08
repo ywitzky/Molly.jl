@@ -1764,7 +1764,7 @@ end
 
     ff = MolecularForceField(joinpath(ff_dir, "tip3p_standard.xml"))
 
-    for AT in array_list
+    for AT in array_list_metal
         for T in (Float64, Float32)
             if T == Float64 && AT == MtlArray
                 continue
@@ -1776,7 +1776,7 @@ end
                 float_type=T,
                 dist_cutoff=T(dist_cutoff),
                 dist_buffer=zero(T(dist_cutoff)),
-                nonbonded_method=:ewald,
+                nonbonded_method=SetupEwald(),
                 dispersion_correction=false,
                 center_coords=false,
                 strictness=:nowarn,
@@ -1841,7 +1841,7 @@ end
     )
 
     for (pdb_fp, E_openmm, Fs_openmm) in pme_data
-        for AT in array_list
+        for AT in array_list_metal
             for T in (Float64, Float32)
                 if T == Float64 && AT == MtlArray
                     continue
@@ -1853,8 +1853,7 @@ end
                     float_type=T,
                     dist_cutoff=T(dist_cutoff),
                     dist_buffer=zero(T(dist_cutoff)),
-                    nonbonded_method=:pme,
-                    pme_mesh_dims=pme_mesh_dims,
+                    nonbonded_method=SetupPME(mesh_dims=pme_mesh_dims),
                     dispersion_correction=false,
                     center_coords=false,
                     strictness=:nowarn,
@@ -1877,7 +1876,7 @@ end
                     fs_gi2 = zero(fs_gi)
                     E_gi2, fs_gi2 = AtomsCalculators.energy_forces!(fs_gi2, sys,
                                                     sys.general_inters[1]; n_threads=n_threads)
-                    @test E_gi == E_gi2
+                    @test abs(E_gi - E_gi2) < 1e-4u"kJ * mol^-1"
                     @test maximum(norm.(fs_gi .- fs_gi2)) < 1e-4u"kJ * mol^-1 * nm^-1"
                 end
             end

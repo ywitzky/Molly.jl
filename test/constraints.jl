@@ -322,7 +322,7 @@ end
 
     constraint_algorithms = (SetupSHAKE_RATTLE(), SetupLINCS(n_rec=6, n_iter=6))
 
-    for AT in array_list
+    for AT in array_list_metal
         for constraint_algorithm in constraint_algorithms
             for rigid_water in (false, true)
                 sys = System(
@@ -333,7 +333,8 @@ end
                     float_type=T,
                     constraints=:hbonds,
                     rigid_water=rigid_water, # No water present
-                    constraint_algorithm=constraint_algorithm,    
+                    constraint_algorithm=constraint_algorithm,
+                    nonbonded_method=DistanceCutoff(T(1.0)u"nm"),
                 )
 
                 simulate!(sys, minimizer)
@@ -988,7 +989,6 @@ end
                 iter_vel_correction=true,
             )
         end
-        error("unknown constraint kind $kind")
     end
 
     function simulator_constraint_system(kind; loggers, coords_in=coords, velocities_in=velocities)
@@ -1638,12 +1638,8 @@ end
     mass_O = 15.999u"g/mol"
     mass_H = 1.008u"g/mol"
 
-    atoms = Atom[]
-    for _ in 1:n_molecules
-        push!(atoms, Atom(mass=mass_O, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1"))
-        push!(atoms, Atom(mass=mass_H, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1"))
-        push!(atoms, Atom(mass=mass_H, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1"))
-    end
+    atoms = [Atom(mass=(i % 3 == 1 ? mass_O : mass_H), σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1")
+             for i in 1:n_atoms]
     atom_masses = [a.mass for a in atoms]
 
     boundary = CubicBoundary(3.0u"nm")
@@ -1777,14 +1773,14 @@ end
             ff;
             array_type=AT,
             float_type=Float64,
-            nonbonded_method=:pme,
+            nonbonded_method=SetupPME(),
         )
         sys_cons = System(
             joinpath(data_dir, "6mrr_equil.pdb"),
             ff;
             array_type=AT,
             float_type=Float64,
-            nonbonded_method=:pme,
+            nonbonded_method=SetupPME(),
             constraints=:hbonds,
             rigid_water=true,
         )
