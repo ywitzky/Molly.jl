@@ -323,11 +323,6 @@ function mark_unwrap!(v::BufferValidity, step_n::Integer)
     return v
 end
 
-function invalidate_unwrap!(v::BufferValidity)
-    v.unwrap_step = INVALID_BUFFER_STEP
-    return v
-end
-
 function has_unwrap(v::BufferValidity, step_n::Integer)
     return v.unwrap_step == step_n
 end

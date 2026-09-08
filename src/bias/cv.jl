@@ -440,18 +440,6 @@ mutable struct CMDistScratch{IV, MV, WV, DV, SV}
     mtot2_buf::SV
 end
 
-# Kept for CalcRg and the CPU/no-scratch fallback -- fine as a serial O(group) sum there.
-@inline function cmdist_com(coords, atoms, idx)
-    n = length(idx)
-    m1 = mass(atoms[idx[1]])
-    acc, mtot = coords[idx[1]] * m1, m1
-    for k in 2:n
-        mk = mass(atoms[idx[k]])
-        acc += coords[idx[k]] * mk
-        mtot += mk
-    end
-    return acc / mtot, mtot
-end
 
 @kernel inbounds=true function cmdist_reduce_kernel!(pmass1, pwpos1, pmass2, pwpos2,
                                                       @Const(coords), @Const(atoms),
