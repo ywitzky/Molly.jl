@@ -25,7 +25,6 @@
         n_threads = 256
         buffers = Molly.init_buffers!(sys, n_threads)
 
-        #=
         @testset "CUDA Launch Config API" begin
             Molly.reset_cuda_launch_config!(sys)
             cfg_auto = Molly.cuda_launch_config(sys)
@@ -250,7 +249,6 @@
                 @test fs_mat[3, orig_idx] ≈ 1.0
             end
         end
-        =#
         
         # A use_cuda_graph=true captured CuGraphExec has the pairwise kernel's launch grid (sized
         # from buffers.num_pairs) frozen in at capture time. A GPU tile-list refresh changes
