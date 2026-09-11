@@ -287,7 +287,8 @@
             buffers_cg = Molly.init_buffers!(sys_cg, 1)
             fs_cg = Molly.zero_forces(sys_cg)
             step_n = 1
-            Molly.warmup_cuda_graph_capture!(fs_cg, sys_cg, nothing, step_n, buffers_cg, true; n_threads=1)
+            Molly.warmup_cuda_graph_capture!(fs_cg, sys_cg, nothing, step_n, buffers_cg, true;
+                                             n_threads=1, strictness=Molly.default_strictness())
 
             Molly.captured_forces_once!(fs_cg, sys_cg, nothing, step_n, buffers_cg, Val(false);
                                         n_threads=1, cuda_graph_capturing=true,
